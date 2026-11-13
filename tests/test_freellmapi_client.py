@@ -83,6 +83,34 @@ class FreeLLMAPIClientTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(json.loads(seen[2].content)["model"], "auto:vision")
 
+    async def test_model_list_moves_to_next_on_quota_or_slowness(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            model = json.loads(request.content)["model"]
+            if model == "gemini-2.5-flash":
+                return httpx.Response(429, json={"error": {"message": "sem cota"}})
+            if model == "lento":
+                raise httpx.ReadTimeout("demorou", request=request)
+            return _ok(f"veio do {model}")
+
+        client, seen = _client(handler)
+        client.text_model = "gemini-2.5-flash, lento ,gpt-oss-120b"
+        response = await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(response.choices[0].message.content, "veio do gpt-oss-120b")
+        self.assertEqual(
+            [json.loads(r.content)["model"] for r in seen],
+            ["gemini-2.5-flash", "lento", "gpt-oss-120b"],
+        )
+
+    async def test_model_list_stops_when_freellmapi_is_down(self) -> None:
+        def down(request):
+            raise httpx.ConnectError("recusado", request=request)
+
+        client, seen = _client(down)
+        client.text_model = "a,b,c"
+        with self.assertRaises(OpenAICompatError):
+            await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(len(seen), 1)
+
     async def test_quota_error_keeps_status_and_retry_after(self) -> None:
         client, _ = _client(
             lambda request: httpx.Response(

@@ -502,8 +502,11 @@ FreeLLMAPI. Se ela estiver fora do ar ou sem cota, a mesma chamada é repetida
 na Groq direta (se `GROQ_API_KEY` existir). A conversa deixa de usar o Gemini
 direto, cuja cota diária é pequena, e o tempo limite social sobe para 8 s.
 Modelos: `FREELLMAPI_MODEL` (conversa), `FREELLMAPI_JSON_MODEL` (interpretação
-de ordens) e `FREELLMAPI_VISION_MODEL` (imagens), com `auto`, `auto:fast`,
-`auto:smart` ou um modelo específico.
+de ordens) e `FREELLMAPI_VISION_MODEL` (imagens). Cada um é uma lista em ordem,
+separada por vírgula (ex.: `gemini-2.5-flash,gpt-oss-120b`): se um modelo falhar
+ou demorar mais que `FREELLMAPI_ATTEMPT_TIMEOUT_SECONDS`, a Bella tenta o próximo.
+Prefira modelos específicos: medido no servidor, respondem em 0,3–1,2 s, enquanto
+`auto` testa o catálogo inteiro e passou de 20 s.
 
 Para economizar RAM em servidores pequenos, `RENDER_DYNAMIC_PAGES=false` desliga
 o Chromium: o FAQ do site continua sendo lido e as páginas aprendidas na última

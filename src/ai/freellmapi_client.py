@@ -45,9 +45,17 @@ def bella_ai_provider() -> str:
 
 
 class OpenAICompatError(RuntimeError):
-    def __init__(self, message: str, status_code: int | None, headers: Any = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None,
+        headers: Any = None,
+        *,
+        connection_failed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.connection_failed = connection_failed
         self.response = SimpleNamespace(headers=dict(headers or {}))
 
 
@@ -81,14 +89,19 @@ class FreeLLMAPIClient:
         json_model: str = "auto",
         vision_model: str = "auto",
         timeout_seconds: float = 20.0,
+        attempt_timeout_seconds: float = 10.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         if not self.base_url.endswith("/v1"):
             self.base_url += "/v1"
         self.api_key = api_key.strip()
+        # Cada um aceita uma lista em ordem, separada por vírgula:
+        # "gemini-2.5-flash,gpt-oss-120b". Modelo específico responde em ~1 s;
+        # "auto" testa o catálogo inteiro e pode passar de 20 s.
         self.text_model = text_model or "auto"
         self.json_model = json_model or self.text_model
         self.vision_model = vision_model or self.text_model
+        self.attempt_timeout_seconds = max(2.0, attempt_timeout_seconds)
         self._http = httpx.AsyncClient(timeout=timeout_seconds)
         self.last_routed_via = ""
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
@@ -104,6 +117,9 @@ class FreeLLMAPIClient:
             json_model=os.getenv("FREELLMAPI_JSON_MODEL", "").strip() or text_model,
             vision_model=os.getenv("FREELLMAPI_VISION_MODEL", "").strip() or text_model,
             timeout_seconds=float(os.getenv("FREELLMAPI_TIMEOUT_SECONDS", "20") or 20),
+            attempt_timeout_seconds=float(
+                os.getenv("FREELLMAPI_ATTEMPT_TIMEOUT_SECONDS", "10") or 10
+            ),
         )
 
     def _model_for(self, kwargs: dict[str, Any]) -> str:
@@ -113,18 +129,41 @@ class FreeLLMAPIClient:
             return self.json_model
         return self.text_model
 
+    def _models_for(self, kwargs: dict[str, Any]) -> list[str]:
+        models = [item.strip() for item in self._model_for(kwargs).split(",")]
+        return [item for item in models if item] or ["auto"]
+
     async def _create(self, **kwargs: Any) -> Any:
+        """Tenta cada modelo da lista; passa para o próximo em limite, erro ou demora."""
+        last_error: OpenAICompatError | None = None
+        for model in self._models_for(kwargs):
+            try:
+                return await self._create_once(model, kwargs)
+            except OpenAICompatError as exc:
+                last_error = exc
+                if exc.connection_failed or exc.status_code in {401, 403}:
+                    raise  # FreeLLMAPI fora do ar ou chave errada: outro modelo não ajuda
+                LOGGER.info("FreeLLMAPI: %s falhou (%s); tentando o próximo.", model, exc)
+        assert last_error is not None
+        raise last_error
+
+    async def _create_once(self, model: str, kwargs: dict[str, Any]) -> Any:
         body = {key: value for key, value in kwargs.items() if key not in GROQ_ONLY_PARAMS}
-        body["model"] = self._model_for(kwargs)
+        body["model"] = model
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         try:
             response = await self._http.post(
-                f"{self.base_url}/chat/completions", json=body, headers=headers
+                f"{self.base_url}/chat/completions",
+                json=body,
+                headers=headers,
+                timeout=self.attempt_timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise OpenAICompatError(f"FreeLLMAPI timeout: {exc}", 408) from exc
+            raise OpenAICompatError(f"FreeLLMAPI timeout em {model}: {exc}", 408) from exc
         except httpx.HTTPError as exc:
-            raise OpenAICompatError(f"FreeLLMAPI connection error: {exc}", 503) from exc
+            raise OpenAICompatError(
+                f"FreeLLMAPI connection error: {exc}", 503, connection_failed=True
+            ) from exc
         if response.status_code >= 400:
             try:
                 error = response.json().get("error", {})
