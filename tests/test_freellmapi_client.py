@@ -165,6 +165,39 @@ class FreeLLMAPIClientTests(unittest.IsolatedAsyncioTestCase):
             await client.chat.completions.create(model="x", messages=[])
         self.assertEqual(len(seen), 0)
 
+    async def test_leaked_reasoning_moves_to_next_model(self) -> None:
+        leaked = (
+            "We need to produce Bella's next message, responding to user 'oi vida'. "
+            "The user says oi vida. We need to respond in Bella's voice."
+        )
+
+        def handler(request):
+            body = json.loads(request.content)
+            if body["model"] == "gpt-oss-120b":
+                return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": leaked}}]})
+            return _ok("oii! tudo bem? ♡")
+
+        client, seen = _client(handler)
+        client.text_model = "gpt-oss-120b,outro"
+        response = await client.chat.completions.create(model="x", messages=[], max_tokens=256)
+        self.assertEqual(response.choices[0].message.content, "oii! tudo bem? ♡")
+        # Modelo que pensa ganha espaço para o raciocínio + a resposta.
+        self.assertGreaterEqual(json.loads(seen[0].content)["max_tokens"], 1000)
+        self.assertEqual(json.loads(seen[1].content)["max_tokens"], 256)
+
+    async def test_reasoning_field_is_not_the_answer(self) -> None:
+        payload = {"choices": [{"message": {"content": "pensando no que dizer", "reasoning": "pensando no que dizer"}}]}
+        client, _ = _client(lambda request: httpx.Response(200, json=payload))
+        client.text_model = "a"
+        with self.assertRaises(OpenAICompatError):
+            await client.chat.completions.create(model="x", messages=[])
+
+    async def test_normal_portuguese_answer_is_kept(self) -> None:
+        payload = {"choices": [{"message": {"content": "Oi! Tudo bem? 🌟", "reasoning": "The user wrote oi vida."}}]}
+        client, _ = _client(lambda request: httpx.Response(200, json=payload))
+        response = await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(response.choices[0].message.content, "Oi! Tudo bem? 🌟")
+
     async def test_quota_error_keeps_status_and_retry_after(self) -> None:
         client, _ = _client(
             lambda request: httpx.Response(

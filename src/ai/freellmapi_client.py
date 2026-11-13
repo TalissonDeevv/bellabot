@@ -19,6 +19,7 @@ import contextvars
 import logging
 import os
 import random
+import re
 import time
 import uuid
 from types import SimpleNamespace
@@ -90,6 +91,40 @@ def _completion_text(payload: Any) -> str:
     return str(content or "")
 
 
+REASONING_MIN_TOKENS = int(os.getenv("FREELLMAPI_REASONING_MIN_TOKENS", "1000") or 1000)
+_THINKING_MODELS = ("gpt-oss", "nemotron", "qwen3", "deepseek-r", "north-mini")
+_REASONING_START = re.compile(
+    r"^\s*(?:we need to|we have to|we should|the user (?:says|said|wrote|asks|is|wants|typed)|"
+    r"the conversation|let me|let's|i need to|i should|okay,? (?:so|the user|let)|ok,? (?:so|the user)|"
+    r"here'?s a thinking process|thinking process|analy[sz]e the|first,? i|so the user|"
+    r"(?:ok|okay),? o usu[aá]rio|o usu[aá]rio (?:disse|escreveu|pediu|quer|mandou)|preciso responder ao usu[aá]rio)",
+    re.IGNORECASE,
+)
+
+
+def _thinks(model: str) -> bool:
+    name = (model or "").casefold()
+    return any(marker in name for marker in _THINKING_MODELS)
+
+
+def _leaked_reasoning(payload: Any) -> bool:
+    """True quando o 'texto da resposta' é, na verdade, o raciocínio do modelo."""
+    try:
+        choice = payload["choices"][0]
+        message = choice.get("message") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return False
+    content = _completion_text(payload).strip()
+    if not content:
+        return False
+    reasoning = str(message.get("reasoning") or message.get("reasoning_content") or "").strip()
+    if reasoning and (content == reasoning or content.startswith(reasoning[:200])):
+        return True
+    if "<think>" in content.casefold() and "</think>" not in content.casefold():
+        return True
+    return bool(_REASONING_START.search(content))
+
+
 def _error_kind(exc: "OpenAICompatError") -> str:
     if exc.connection_failed:
         return "connection"
@@ -100,7 +135,7 @@ def _error_kind(exc: "OpenAICompatError") -> str:
         return "timeout"
     if status == 429:
         return "rate_limit"
-    if "vazia" in str(exc):
+    if "vazia" in str(exc) or "raciocínio" in str(exc):
         return "empty"
     if "JSON inválido" in str(exc):
         return "invalid_json"
@@ -312,6 +347,10 @@ class FreeLLMAPIClient:
     async def _create_once(self, model: str, kwargs: dict[str, Any], *, timeout: float | None = None) -> Any:
         body = {key: value for key, value in kwargs.items() if key not in GROQ_ONLY_PARAMS}
         body["model"] = model
+        if _thinks(model) and int(body.get("max_tokens") or 0) < REASONING_MIN_TOKENS:
+            # Modelos que "pensam" gastam tokens no raciocínio antes da resposta;
+            # com pouco espaço, sobra só o raciocínio (que alguns provedores devolvem como texto).
+            body["max_tokens"] = REASONING_MIN_TOKENS
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         try:
             response = await self._http.post(
@@ -342,6 +381,8 @@ class FreeLLMAPIClient:
             payload = response.json()
         except ValueError as exc:
             raise OpenAICompatError(f"FreeLLMAPI {model}: JSON inválido", 502) from exc
+        if _leaked_reasoning(payload):
+            raise OpenAICompatError(f"FreeLLMAPI {model}: devolveu o raciocínio em vez da resposta", 502)
         if not _completion_text(payload).strip():
             # 200 sem texto (ex.: modelo que "não viu" a imagem): conta como falha
             # para a lista seguir para o próximo modelo.
