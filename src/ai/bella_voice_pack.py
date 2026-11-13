@@ -71,6 +71,14 @@ def build_bella_voice_context(
     text = normalize_text(message)
     categories = _categories_for(text)
     positives = _select_positive_examples(categories, max_positive, seed=text)
+    if not categories & {"humor", "laughter", "natural_laughter", "meme"}:
+        # 66 dos 95 exemplos têm risada; mostrados em toda mensagem, ensinavam a
+        # Bella a rir sempre. Fora de brincadeira, vão sem a risada.
+        positives = [
+            {**item, "assistant": _strip_laughter(str(item.get("assistant", "")))}
+            for item in positives
+        ]
+        positives = [item for item in positives if item["assistant"]]
     forbidden = _select_forbidden_examples(categories, max_forbidden)
     repeated = "\n".join(f"- {item}" for item in (recent_responses or []) if item.strip())
     positive_text = "\n".join(
@@ -93,6 +101,18 @@ def build_bella_voice_context(
         "RESPOSTAS RECENTES QUE NÃO PODEM VIRAR LOOP:\n"
         f"{repeated or '- nenhuma relevante'}"
     )
+
+
+_LAUGHTER_RE = re.compile(
+    r"\s*\b(?:k{3,}|(?:hi){2,}h?|(?:he){2,}h?|(?:ks){2,}k?|(?:rs){2,}r?)\b[.!]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_laughter(value: str) -> str:
+    text = _LAUGHTER_RE.sub("", value)
+    text = re.sub(r"\s+([,.!?])", r"\1", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" ,")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -126,6 +146,8 @@ def _categories_for(text: str) -> set[str]:
         categories.add("self")
     if any(term in text for term in ("kkkk", "haha", "meme", "lerda", "doida", "noiada", "zoeira")):
         categories.add("humor")
+    if any(term in text for term in ("ajuda", "ajudar", "duvida", "dúvida")):
+        categories.add("support")
     if any(term in text for term in ("erro", "bug", "codigo", "código", "api", "python", "javascript", "programar")):
         categories.add("technical")
         categories.add("support")
