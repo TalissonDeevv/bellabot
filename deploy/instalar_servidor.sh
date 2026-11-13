@@ -132,7 +132,8 @@ sudo systemctl restart "$SERVICE_NAME"
 echo "==> 7/7 Backup diário às 04:30 (guarda os 7 últimos em ~/backups-bella)"
 mkdir -p "$HOME/backups-bella"
 CRON_LINE="30 4 * * * bash $DEPLOY_DIR/backup.sh >> $HOME/backups-bella/backup.log 2>&1"
-( crontab -l 2>/dev/null | grep -v 'deploy/backup.sh' ; echo "$CRON_LINE" ) | crontab -
+# Sem crontab ainda, "crontab -l" falha; com pipefail isso pararia o script.
+{ crontab -l 2>/dev/null | grep -v 'deploy/backup.sh' || true; echo "$CRON_LINE"; } | crontab -
 
 ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo

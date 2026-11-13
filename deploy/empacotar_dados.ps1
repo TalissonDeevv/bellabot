@@ -1,4 +1,4 @@
-# Gera o pacote PRIVADO com o que não vai para o repositório: .env (tokens e
+﻿# Gera o pacote PRIVADO com o que não vai para o repositório: .env (tokens e
 # chaves) e a pasta data (bancos da Bella). Mande para quem vai hospedar por um
 # canal privado (DM, pendrive, Drive com acesso restrito). Nunca no GitHub.
 #
