@@ -39,6 +39,13 @@ ACTIVITY_SECTION = "owner_client_activity"
 META_SECTION = "owner_assistant_meta"
 DRAFTS_SECTION = "owner_client_drafts"
 LEAVES_SECTION = "owner_member_leaves"
+IDEAS_SECTION = "owner_ideas"
+BILLS_SECTION = "owner_bills"
+LOG_SECTION = "owner_activity_log"
+INBOX_SECTION = "agent_inbox"
+MESSAGES_SECTION = "talisson_reminders"
+MONTHS_PT = ("", "janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho",
+             "agosto", "setembro", "outubro", "novembro", "dezembro")
 TODO_SECTION = "agent_todos"
 PAYMENT_SECTION = "agent_payment_links"
 TICKET_SECTION = "smart_tickets"
@@ -64,6 +71,23 @@ RANKING_RE = re.compile(r"\b(?:ranking|desempenho|avaliacao) da (?:staff|equipe|
 CLIENTS_RE = re.compile(r"\bclientes? (?:sumidos?|inativos?|parados?|antigos?)\b")
 APPROVE_RE = re.compile(r"^(?:pode mandar|manda(?: sim| ai| pra ele| pra ela)?|envia|pode enviar|aprovado|aprovo)\b")
 REJECT_RE = re.compile(r"^(?:nao manda|descarta|deixa pra la|cancela (?:a )?mensagem|nao envia)\b")
+TRAVEL_RE = re.compile(
+    r"\b(?:vou (?:ficar fora|viajar|estar fora|sair de ferias|entrar de ferias|tirar ferias)|"
+    r"(?:to|estou|estarei|vou estar|vou ficar) (?:de ferias|viajando|fora)|modo (?:viagem|ferias)|"
+    r"ferias ate|viagem ate|fora ate)\b"
+)
+RETURN_RE = re.compile(r"^(?:bella[,:]?\s*)?(?:voltei|cheguei|to de volta|estou de volta|acabou (?:a viagem|as ferias)|sai do modo (?:viagem|ferias))\b")
+IDEA_RE = re.compile(r"^(?:bella[,:]?\s*)?(?:ideia|tive uma ideia|anota (?:essa |uma |a )?ideia|nova ideia|ideia nova)\s*[:,\-]?\s*")
+IDEA_LIST_RE = re.compile(r"\b(?:minhas ideias|caixa de ideias|lista de ideias|quais ideias)\b")
+BILL_RE = re.compile(
+    r"\b(?:vence|vencimento|pago|pagar|pagamento|cobra\w*|boleto|fatura|conta)\b.*\bdia (\d{1,2})\b"
+    r"|\btodo (?:dia|mes no dia) (\d{1,2})\b"
+)
+MONTHLY_RE = re.compile(r"\b(?:todo mes|todos os meses|mensal\w*|de cada mes|todo dia \d{1,2}|todo mes no dia)\b")
+BILL_LIST_RE = re.compile(r"\b(?:minhas contas|contas (?:a|pra|para) pagar|contas do mes|quais contas)\b")
+BILL_PAID_RE = re.compile(r"^(?:bella[,:]?\s*)?(?:ja )?pag(?:uei|amos|o)\s+(?:a |o |as |os )?(?:conta (?:da |do |de )?)?(.+)$")
+BILL_REMOVE_RE = re.compile(r"\b(?:remove|apaga|tira|cancela|exclui)\w* (?:a )?conta (?:da |do |de )?(.+)$")
+DOING_RE = re.compile(r"\b(?:o que (?:eu )?(?:tava|estava) fazendo|onde (?:eu )?parei|o que ficou (?:pela metade|pendente)|em que (?:eu )?parei)\b")
 COMMIT_RE = re.compile(r"\b(?:aceit\w*|fech\w*|peg\w*|cobr\w*|faz\w*|vou fazer)\b")
 MONEY_RE = re.compile(r"(?:r\$\s*\d|\d+\s*(?:reais|conto|mil)\b)")
 QUESTION_START = re.compile(
@@ -85,6 +109,12 @@ def _iso(value: Any) -> datetime | None:
     return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
+def _strip_lead(content: str) -> str:
+    text = re.sub(r"<@!?\d+>", " ", content or "")
+    text = re.sub(r"(?i)^\s*bella\s*[,:]?\s*", "", text.strip())
+    return " ".join(text.split())
+
+
 def _brl(value: float) -> str:
     text = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return f"R$ {text}"
@@ -102,7 +132,12 @@ class OwnerAssistant:
         reminders: Any | None = None,
         channel_id: int | None = None,
         timezone_name: str = "America/Recife",
+        availability: Any | None = None,
+        refresh_presence: Any | None = None,
     ) -> None:
+        self.availability = availability
+        self.refresh_presence = refresh_presence
+        self.pause_hours = float(os.getenv("OWNER_PAUSE_HOURS", "3") or 3)
         self.bot = bot
         self.state = state
         self.owner_id = int(owner_id)
@@ -145,12 +180,40 @@ class OwnerAssistant:
             return None
         in_channel = self.is_owner_channel(message)
         text = _norm(re.sub(r"<@!?\d+>", " ", content)).strip(" ?!.")
+        welcome = await self._track_activity(content, in_channel=in_channel)
+        if DOING_RE.search(text):
+            return await self.what_was_i_doing()
+        if welcome:
+            await self.say(welcome)
         if in_channel and self._audio(message) is not None:
             return await self.start_spoken_agenda(message)
+        if RETURN_RE.search(text) and await self._travel():
+            return await self.end_travel()
+        if TRAVEL_RE.search(text):
+            return await self.start_travel(content, message)
+        if MONTHLY_RE.search(text) and BILL_RE.search(text):
+            return await self.save_bill(content)
+        if BILL_LIST_RE.search(text):
+            return await self.bills_text()
+        removed = BILL_REMOVE_RE.search(text)
+        if removed:
+            return await self.remove_bill(removed.group(1))
+        paid = BILL_PAID_RE.search(text)
+        if paid:
+            answer = await self.mark_bill_paid(paid.group(1))
+            if answer:
+                return answer
         if AGENDA_RE.search(text):
             return await self.agenda_text(tomorrow="amanha" in text)
         if not in_channel:
             return None
+        if IDEA_RE.search(text) and len(text) > 12:
+            return await self.save_idea(content)
+        if IDEA_LIST_RE.search(text):
+            return await self.ideas_text()
+        review = await self._idea_review_answer(text)
+        if review:
+            return review
         drafts = await self.state.get_section(DRAFTS_SECTION)
         open_drafts = [d for d in drafts.values() if isinstance(d, dict) and d.get("status") == "waiting"]
         if open_drafts and APPROVE_RE.search(text):
@@ -743,6 +806,342 @@ class OwnerAssistant:
             lines += ["", ideas]
         return "\n".join(lines)
 
+    # ------------------------------------------- "o que eu tava fazendo?"
+    async def _track_activity(self, content: str, *, in_channel: bool) -> str:
+        """Registra o pedido e, se ele voltou de uma pausa, devolve o 'bem-vindo de volta'."""
+        now = datetime.now(timezone.utc)
+        section = await self.state.get_section(LOG_SECTION)
+        items = list(section.get("items", []))
+        last = _iso(items[-1]["at"]) if items else None
+        text = " ".join(re.sub(r"<@!?\d+>", " ", content).split())[:300]
+        if text:
+            items.append({"at": now.isoformat(), "text": text})
+            await self.state.update_section(LOG_SECTION, "items", items[-60:])
+        if not in_channel or last is None or now - last < timedelta(hours=self.pause_hours):
+            return ""
+        if DOING_RE.search(_norm(text)):
+            return ""
+        summary = await self.what_was_i_doing(before=last + timedelta(seconds=1), quiet=True)
+        return f"bem-vindo de volta! ♡ {summary}" if summary else ""
+
+    async def what_was_i_doing(self, *, before: datetime | None = None, quiet: bool = False) -> str:
+        items = (await self.state.get_section(LOG_SECTION)).get("items", [])
+        if before is not None:
+            items = [i for i in items if (_iso(i.get("at")) or before) < before]
+        else:
+            items = items[:-1]  # tira a própria pergunta
+        session: list[dict[str, Any]] = []
+        for item in reversed(items):
+            moment = _iso(item.get("at"))
+            if session and moment and _iso(session[-1]["at"]) - moment > timedelta(hours=self.pause_hours):
+                break
+            session.append(item)
+        session.reverse()
+        since = _iso(session[0]["at"]) if session else datetime.now(timezone.utc) - timedelta(days=1)
+        open_tasks = [t for t in await self._todos() if not t.get("done") and (_iso(t.get("created_at")) or since) >= since - timedelta(minutes=1)]
+        lines: list[str] = []
+        if session:
+            when = _iso(session[-1]["at"]).astimezone(self.tz).strftime("%d/%m às %Hh%M").replace("h00", "h")
+            lines.append(f"da última vez ({when}) você estava em:")
+            lines += [f"• {i['text'][:160]}" for i in session[-5:]]
+        if open_tasks:
+            lines.append("ficou pela metade:")
+            lines += [f"• {t['text']}" for t in open_tasks[-8:]]
+        soon = await self._reminders_on(self.now().date())
+        if soon:
+            lines.append("e hoje ainda tem:")
+            lines += [f"• {r['hora']} — {r['description']}" for r in soon[:5]]
+        if not lines:
+            return "" if quiet else "não achei nada recente: nenhum pedido seu nem tarefa aberta."
+        return "\n".join(lines)
+
+    # ------------------------------------------------------ modo viagem
+    async def _travel(self) -> dict[str, Any] | None:
+        travel = (await self.state.get_section(META_SECTION)).get("travel")
+        return travel if isinstance(travel, dict) and travel.get("active") else None
+
+    def _parse_until(self, text: str) -> datetime | None:
+        today = self.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        match = re.search(r"\bate (?:o )?(?:dia )?(\d{1,2})(?:/(\d{1,2}))?(?:/(\d{2,4}))?\b", text)
+        if match:
+            day = int(match.group(1))
+            month = int(match.group(2) or today.month)
+            year = int(match.group(3) or today.year)
+            year = year + 2000 if year < 100 else year
+            month_word = re.search(r"\bate (?:o )?(?:dia )?\d{1,2} de (" + "|".join(_norm(m) for m in MONTHS_PT[1:]) + r")\b", text)
+            if month_word:
+                month = [_norm(m) for m in MONTHS_PT].index(month_word.group(1))
+            try:
+                candidate = today.replace(year=year, month=month, day=day)
+            except ValueError:
+                return None
+            if candidate < today and not match.group(2):
+                next_month = month % 12 + 1
+                candidate = candidate.replace(year=year + (month == 12), month=next_month)
+            return candidate
+        if re.search(r"\bate (?:depois de )?amanha\b", text):
+            return today + timedelta(days=2 if "depois" in text else 1)
+        weekday = re.search(r"\bate (?:a |o )?(?:proxima |proximo )?(segunda|terca|quarta|quinta|sexta|sabado|domingo)\b", text)
+        if weekday:
+            target = [_norm(d) for d in WEEKDAYS].index(weekday.group(1))
+            ahead = (target - today.weekday()) % 7 or 7
+            return today + timedelta(days=ahead)
+        weeks = re.search(r"\bpor (\d+|uma|duas|tres) semanas?\b", text)
+        if weeks:
+            amount = {"uma": 1, "duas": 2, "tres": 3}.get(weeks.group(1)) or int(weeks.group(1))
+            return today + timedelta(days=7 * amount)
+        return None
+
+    async def start_travel(self, content: str, message: Any) -> str:
+        text = _norm(content)
+        until = self._parse_until(text)
+        if until is None:
+            return "anotei que você vai ficar fora, mas até quando? (ex.: \"até dia 20\")"
+        label = f"{until.day:02d}/{until.month:02d}"
+        reason = "férias" if "feria" in text else "viagem"
+        travel = {
+            "active": True, "reason": reason, "until": until.isoformat(), "label": label,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "previous_presence": await self.state.get("custom_presence_override"),
+        }
+        await self.state.update_section(META_SECTION, "travel", travel)
+        if self.availability is not None:
+            try:
+                await self.availability.set_status(
+                    reason=f"{reason} até {label}", original_text=content,
+                    guild_id=getattr(getattr(message, "guild", None), "id", 0) or 0,
+                    channel_id=message.channel.id, message_id=getattr(message, "id", 0) or 0,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Falha ao marcar a ausência no modo viagem.")
+        await self.state.set("custom_presence_override", {
+            "enabled": True, "status": "idle", "activity_type": "custom",
+            "text": f"Talisson de {reason} • volta dia {label}",
+        })
+        await self._refresh_presence()
+        return (
+            f"modo {reason} ligado até **{label}**. ♡\n"
+            "• mudei meu status;\n• quem te chamar fica sabendo quando você volta e eu anoto o recado;\n"
+            "• guardo tudo (menções, recados, tickets, orçamentos, pagamentos) e te entrego um resumo na volta.\n"
+            "quando voltar é só falar \"voltei\" (ou eu encerro sozinha no dia seguinte)."
+        )
+
+    async def end_travel(self) -> str:
+        travel = await self._travel()
+        if travel is None:
+            return "você não estava no modo viagem."
+        travel["active"] = False
+        travel["ended_at"] = datetime.now(timezone.utc).isoformat()
+        await self.state.update_section(META_SECTION, "travel", travel)
+        if self.availability is not None:
+            try:
+                await self.availability.clear_status()
+            except Exception:  # noqa: BLE001
+                LOGGER.exception("Falha ao limpar a ausência do modo viagem.")
+        previous = travel.get("previous_presence")
+        await self.state.set("custom_presence_override", previous if isinstance(previous, dict) else {"enabled": False})
+        await self._refresh_presence()
+        return "bem-vindo de volta! ♡\n\n" + await self.away_summary(_iso(travel.get("started_at")) or datetime.now(timezone.utc))
+
+    async def _refresh_presence(self) -> None:
+        if self.refresh_presence is None:
+            return
+        try:
+            await self.refresh_presence()
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("Não consegui atualizar o status da Bella.")
+
+    async def away_summary(self, since: datetime) -> str:
+        lines = [f"**enquanto você esteve fora (desde {since.astimezone(self.tz).strftime('%d/%m')}):**"]
+        inbox = [
+            item for values in (await self.state.get_section(INBOX_SECTION)).values() if isinstance(values, list)
+            for item in values if (_iso(item.get("at")) or since) >= since
+        ]
+        urgent = [i for i in inbox if i.get("urgent")]
+        lines.append(f"\n**te chamaram {len(inbox)} vez(es)**" + (f", {len(urgent)} parecendo urgente:" if urgent else ":" if inbox else "."))
+        for item in sorted(inbox, key=lambda i: (not i.get("urgent"), i.get("at", "")))[:10]:
+            flag = "🔴 " if item.get("urgent") else "• "
+            lines.append(f"{flag}{item.get('author_name', '?')} em #{item.get('channel_name', '?')}: \"{item.get('snippet', '')[:120]}\" {item.get('jump_url', '')}")
+        notes = [v for v in (await self.state.get_section(MESSAGES_SECTION)).values()
+                 if isinstance(v, dict) and (_iso(v.get("created_at")) or since) >= since]
+        if notes:
+            lines.append(f"\n**recados ({len(notes)}):**")
+            lines += [f"• {n.get('author_name', '?')} ({n.get('category', 'Contato')}): {str(n.get('subject', ''))[:140]}" for n in notes[:10]]
+        tickets = [t for t in (await self.state.get_section(TICKET_SECTION)).values()
+                   if isinstance(t, dict) and (_iso(t.get("created_at")) or since) >= since]
+        quotes = [t for t in tickets if t.get("quote_summary")]
+        if tickets:
+            lines.append(f"\n**tickets:** {len(tickets)} aberto(s)" + (f", {len(quotes)} de orçamento:" if quotes else "."))
+            lines += [f"• {t.get('creator_name', '?')}: {str(t['quote_summary'].get('titulo', ''))[:100]}" for t in quotes[:5]]
+        lines.append(f"\n**dinheiro:** {await self._revenue(since)}")
+        pending = [t for t in await self._todos() if not t.get("done")]
+        if pending:
+            lines.append(f"\n**suas tarefas abertas ({len(pending)}):**")
+            lines += [f"• {t['text']}" for t in pending[:8]]
+        return "\n".join(lines)
+
+    # ------------------------------------------------------ caixa de ideias
+    async def save_idea(self, content: str) -> str:
+        text = IDEA_RE.sub("", _strip_lead(content), count=1).strip(" :-,") or content.strip()
+        text = re.sub(r"(?i)^(?:ideia|tive uma ideia|anota (?:essa |uma |a )?ideia|nova ideia|ideia nova)\s*[:,\-]?\s*", "", text).strip()
+        if len(text) < 4:
+            return "qual é a ideia?"
+        idea_id = f"i{int(time.time() * 1000)}"
+        await self.state.update_section(IDEAS_SECTION, idea_id, {
+            "id": idea_id, "text": text[:500], "status": "open", "created_at": self.now().isoformat(),
+        })
+        total = len(await self._ideas())
+        return f"guardei na caixa de ideias: \"{text[:200]}\" ({total} na caixa). todo mês eu te pergunto quais valem tirar do papel."
+
+    async def _ideas(self, status: str = "open") -> list[dict[str, Any]]:
+        values = (await self.state.get_section(IDEAS_SECTION)).values()
+        return sorted((v for v in values if isinstance(v, dict) and v.get("status") == status), key=lambda v: v.get("created_at", ""))
+
+    async def ideas_text(self) -> str:
+        ideas = await self._ideas()
+        if not ideas:
+            return "a caixa de ideias tá vazia. é só mandar \"ideia: ...\" aqui."
+        return "**caixa de ideias:**\n" + "\n".join(f"{i}. {d['text']}" for i, d in enumerate(ideas, start=1))
+
+    async def monthly_idea_review(self) -> None:
+        ideas = await self._ideas()
+        if not ideas:
+            return
+        await self.state.update_section(META_SECTION, "idea_review", {
+            "ids": [d["id"] for d in ideas[:20]], "at": datetime.now(timezone.utc).isoformat(),
+        })
+        await self.say(
+            "💡 **revisão mensal da caixa de ideias**\n"
+            + "\n".join(f"{i}. {d['text']}" for i, d in enumerate(ideas[:20], start=1))
+            + "\n\nquais valem tirar do papel? responde com os números (ex.: \"a 1 e a 3\"). "
+            "pra jogar fora, \"descarta a 2\"."
+        )
+
+    async def _idea_review_answer(self, text: str) -> str:
+        review = (await self.state.get_section(META_SECTION)).get("idea_review")
+        if not isinstance(review, dict) or not review.get("ids"):
+            return ""
+        opened = _iso(review.get("at"))
+        if opened is None or datetime.now(timezone.utc) - opened > timedelta(days=5):
+            return ""
+        numbers = [int(n) for n in re.findall(r"\b(\d{1,2})\b", text)]
+        if not numbers or len(text) > 120:
+            return ""
+        ids = review["ids"]
+        discard = bool(re.search(r"\b(?:descarta|joga fora|apaga|tira|remove)\b", text))
+        section = await self.state.get_section(IDEAS_SECTION)
+        picked = []
+        for number in numbers:
+            if 1 <= number <= len(ids) and isinstance(section.get(ids[number - 1]), dict):
+                idea = section[ids[number - 1]]
+                idea["status"] = "discarded" if discard else "chosen"
+                idea["decided_at"] = self.now().isoformat()
+                await self.state.update_section(IDEAS_SECTION, idea["id"], idea)
+                if not discard:
+                    await self._add_todo(f"tirar do papel: {idea['text'][:250]}")
+                picked.append(idea["text"])
+        if not picked:
+            return ""
+        if discard:
+            return "descartei: " + "; ".join(picked[:5]) + "."
+        return "boa! virou tarefa:\n" + "\n".join(f"• {p}" for p in picked)
+
+    # ------------------------------------------------------- contas a pagar
+    async def save_bill(self, content: str) -> str:
+        norm = _norm(content)
+        match = BILL_RE.search(norm)
+        day = int(match.group(1) or match.group(2))
+        if not 1 <= day <= 31:
+            return "esse dia não existe. qual é o dia do vencimento?"
+        raw = _strip_lead(content)
+        name = re.split(r"(?i)\s+(?:vence|vencimento|é todo|e todo|todo dia|todo m[eê]s|dia \d)", raw)[0]
+        name = re.sub(r"(?i)^(?:a |o |eu )?(?:pago |pagar |pagamento |boleto |fatura |conta )?(?:da |do |de |a |o )?", "", name).strip(" ,.:-")
+        name = re.sub(r"(?i)\s*r\$\s*[\d.,]+", "", name).strip() or "conta"
+        amount_match = re.search(r"r\$\s*([\d.,]+)", norm)
+        amount = None
+        if amount_match:
+            try:
+                amount = float(amount_match.group(1).replace(".", "").replace(",", "."))
+            except ValueError:
+                amount = None
+        bill_id = f"b{_norm(name).replace(' ', '-')[:40]}"
+        await self.state.update_section(BILLS_SECTION, bill_id, {
+            "id": bill_id, "name": name[:80], "day": day, "amount": amount, "active": True,
+            "created_at": self.now().isoformat(), "notified_for": "", "paid_for": "",
+        })
+        value = f" ({_brl(amount)})" if amount else ""
+        return f"anotado: **{name}**{value} vence todo dia {day}. te lembro 2 dias antes, todo mês. ♡"
+
+    async def _bills(self) -> list[dict[str, Any]]:
+        values = (await self.state.get_section(BILLS_SECTION)).values()
+        return sorted((v for v in values if isinstance(v, dict) and v.get("active")), key=lambda v: v["day"])
+
+    def _next_due(self, day: int):
+        today = self.now().date()
+        for offset in (0, 1):
+            month = (today.month - 1 + offset) % 12 + 1
+            year = today.year + (today.month - 1 + offset) // 12
+            last_day = (datetime(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)).day
+            due = today.replace(year=year, month=month, day=min(day, last_day))
+            if due >= today:
+                return due
+        return today
+
+    async def bills_text(self) -> str:
+        bills = await self._bills()
+        if not bills:
+            return "nenhuma conta cadastrada. ex.: \"Contabo vence dia 10 todo mês\"."
+        lines = ["**contas do mês:**"]
+        for bill in bills:
+            due = self._next_due(bill["day"])
+            paid = " ✅ paga" if bill.get("paid_for") == due.isoformat() else ""
+            value = f" — {_brl(bill['amount'])}" if bill.get("amount") else ""
+            lines.append(f"• {bill['name']}{value}: dia {bill['day']} (próximo {due.strftime('%d/%m')}){paid}")
+        return "\n".join(lines)
+
+    async def _find_bill(self, name: str) -> dict[str, Any] | None:
+        wanted = _norm(name).strip(" .!")
+        for bill in await self._bills():
+            bill_name = _norm(bill["name"])
+            if bill_name and (bill_name in wanted or wanted in bill_name):
+                return bill
+        return None
+
+    async def mark_bill_paid(self, name: str) -> str:
+        bill = await self._find_bill(name)
+        if bill is None:
+            return ""
+        bill["paid_for"] = self._next_due(bill["day"]).isoformat()
+        await self.state.update_section(BILLS_SECTION, bill["id"], bill)
+        return f"marquei **{bill['name']}** como paga neste mês. ♡"
+
+    async def remove_bill(self, name: str) -> str:
+        bill = await self._find_bill(name)
+        if bill is None:
+            return "não achei essa conta."
+        bill["active"] = False
+        await self.state.update_section(BILLS_SECTION, bill["id"], bill)
+        return f"tirei **{bill['name']}** das contas."
+
+    async def check_bills(self) -> int:
+        today = self.now().date()
+        sent = 0
+        for bill in await self._bills():
+            due = self._next_due(bill["day"])
+            key = due.isoformat()
+            if bill.get("paid_for") == key or bill.get("notified_for") == key:
+                continue
+            days = (due - today).days
+            if days > 2:
+                continue
+            when = "hoje" if days == 0 else "amanhã" if days == 1 else f"em {days} dias"
+            value = f" ({_brl(bill['amount'])})" if bill.get("amount") else ""
+            await self.say(f"💸 **{bill['name']}**{value} vence {when}, dia {due.strftime('%d/%m')}. quando pagar, me fala \"paguei a {bill['name']}\".")
+            bill["notified_for"] = key
+            await self.state.update_section(BILLS_SECTION, bill["id"], bill)
+            sent += 1
+        return sent
+
     # ------------------------------------------------------------- worker
     async def worker(self) -> None:
         wait = getattr(self.bot, "wait_until_ready", None)
@@ -766,7 +1165,18 @@ class OwnerAssistant:
         if now.day == 1 and now.hour >= 9 and meta.get("ranking_sent") != month:
             await self.state.update_section(META_SECTION, "ranking_sent", month)
             await self.say(await self.staff_ranking(days=31))
+        if now.day == 1 and now.hour >= 11 and meta.get("ideas_review_sent") != month:
+            await self.state.update_section(META_SECTION, "ideas_review_sent", month)
+            await self.monthly_idea_review()
         today = now.strftime("%Y-%m-%d")
+        if now.hour >= 9 and meta.get("bills_checked") != today:
+            await self.state.update_section(META_SECTION, "bills_checked", today)
+            await self.check_bills()
+        travel = meta.get("travel")
+        if isinstance(travel, dict) and travel.get("active"):
+            until = _iso(travel.get("until"))
+            if until is not None and now >= until.astimezone(self.tz) + timedelta(days=1, hours=9):
+                await self.say(await self.end_travel())
         if now.hour >= 10 and meta.get("daily_checks") != today:
             await self.state.update_section(META_SECTION, "daily_checks", today)
             channel = self.channel()

@@ -550,9 +550,11 @@ class TalissonAvailabilityCenter:
         status = await self.status()
         if status:
             reason = str(status.get("reason") or "um compromisso informado")
+            back = re.search(r"até (\d{2}/\d{2})", reason)
+            return_text = f" e volta dia {back.group(1)}" if back else ""
             return (
-                f"Talisson está ausente no momento devido a {_availability_phrase(reason)}. "
-                "Assim que retornar poderá analisar novas solicitações.\n\n"
+                f"Talisson está ausente no momento devido a {_availability_phrase(reason)}{return_text}. "
+                "Assim que retornar poderá analisar novas solicitações. Se quiser, me deixa um recado que eu entrego pra ele.\n\n"
                 "Normalmente, ele atende de segunda a sexta, das 09h às 18h, sempre com horário marcado."
             )
         return (

@@ -182,5 +182,120 @@ class OwnerAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("dinheiro", summary)
 
 
+class FakeAvailability:
+    def __init__(self) -> None:
+        self.status = None
+
+    async def set_status(self, **kwargs):
+        self.status = kwargs
+
+    async def clear_status(self):
+        self.status = None
+
+
+class OwnerDailyLifeTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.state = StateStore(Path(self._dir.name) / "s.json")
+        self.bot = FakeBot()
+        self.availability = FakeAvailability()
+        self.presence_calls = 0
+
+        async def refresh():
+            self.presence_calls += 1
+
+        self.owner = OwnerAssistant(
+            self.bot, self.state, owner_id=OWNER, channel_id=CHANNEL,
+            reminders=ReminderService(self.bot, self.state, ai_service=None),
+            availability=self.availability, refresh_presence=refresh,
+        )
+
+    async def asyncTearDown(self) -> None:
+        self._dir.cleanup()
+
+    async def _say(self, text: str, **kwargs):
+        return await self.owner.handle(_message(text, **kwargs), text)
+
+    async def test_travel_mode_round_trip(self) -> None:
+        back = self.owner.now() + timedelta(days=5)
+        label = back.strftime("%d/%m")
+        answer = await self._say(f"bella, vou ficar fora até {label}")
+        self.assertIn(label, answer)
+        self.assertIn(f"até {label}", self.availability.status["reason"])
+        presence = await self.state.get("custom_presence_override")
+        self.assertTrue(presence["enabled"])
+        self.assertIn(label, presence["text"])
+        self.assertEqual(self.presence_calls, 1)
+        await self.state.update_section("agent_inbox", "5", [{
+            "at": datetime.now(timezone.utc).isoformat(), "author_name": "Cliente", "channel_name": "geral",
+            "snippet": "talisson, preciso de um orçamento urgente", "urgent": True, "jump_url": "",
+        }])
+        summary = await self._say("voltei")
+        self.assertIn("preciso de um orçamento urgente", summary)
+        self.assertIsNone(self.availability.status)
+        self.assertFalse((await self.state.get("custom_presence_override"))["enabled"])
+
+    async def test_travel_needs_a_date(self) -> None:
+        self.assertIn("até quando", await self._say("vou viajar"))
+
+    async def test_travel_ends_by_itself(self) -> None:
+        past = self.owner.now() - timedelta(days=3)
+        await self.state.update_section("owner_assistant_meta", "travel", {
+            "active": True, "until": past.isoformat(), "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+        await self.owner.tick()
+        self.assertTrue(any("bem-vindo de volta" in text for text in self.bot.channel.sent))
+
+    async def test_idea_box_and_monthly_review(self) -> None:
+        saved = await self._say("ideia: fazer curso de bots")
+        self.assertIn("fazer curso de bots", saved)
+        await self._say("ideia: canal no youtube")
+        self.assertIn("canal no youtube", await self._say("minhas ideias"))
+        await self.owner.monthly_idea_review()
+        self.assertIn("revisão mensal", self.bot.channel.sent[-1])
+        chosen = await self._say("a 1")
+        self.assertIn("fazer curso de bots", chosen)
+        todos = (await self.state.get_section(TODO_SECTION))[str(OWNER)]
+        self.assertIn("tirar do papel: fazer curso de bots", todos[-1]["text"])
+        self.assertEqual(len(await self.owner._ideas()), 1)
+
+    async def test_bills_remind_once_two_days_before(self) -> None:
+        due = self.owner.now() + timedelta(days=1)
+        answer = await self._say(f"Contabo vence dia {due.day} todo mês R$ 40,00")
+        self.assertIn("Contabo", answer)
+        self.assertIn("R$ 40,00", answer)
+        self.assertEqual(await self.owner.check_bills(), 1)
+        self.assertIn("Contabo", self.bot.channel.sent[-1])
+        self.assertEqual(await self.owner.check_bills(), 0)  # não repete no mesmo mês
+        self.assertIn("paga", await self._say("paguei a Contabo"))
+        self.assertIn("✅", await self._say("minhas contas"))
+        self.assertIn("tirei", await self._say("remove a conta da Contabo"))
+
+    async def test_far_bill_is_not_reminded_yet(self) -> None:
+        due = self.owner.now() + timedelta(days=10)
+        await self._say(f"conta de luz vence dia {due.day} todo mês")
+        if (self.owner._next_due(due.day) - self.owner.now().date()).days > 2:
+            self.assertEqual(await self.owner.check_bills(), 0)
+
+    async def test_what_was_i_doing_and_welcome_back(self) -> None:
+        await self._say("anota: decidi cobrar entrada de 50%")
+        await self._add_task("terminar o painel do cliente")
+        old = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        log = await self.state.get_section("owner_activity_log")
+        for item in log["items"]:
+            item["at"] = old
+        await self.state.update_section("owner_activity_log", "items", log["items"])
+        await self._say("bom dia bella")
+        self.assertTrue(self.bot.channel.sent)
+        welcome = self.bot.channel.sent[-1]
+        self.assertIn("bem-vindo de volta", welcome)
+        self.assertIn("cobrar entrada de 50%", welcome)
+        doing = await self._say("o que eu tava fazendo?")
+        self.assertIn("bom dia bella", doing)
+
+    async def _add_task(self, text: str) -> None:
+        await self.owner._add_todo(text)
+
+
 if __name__ == "__main__":
     unittest.main()

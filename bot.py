@@ -522,6 +522,8 @@ owner_assistant = OwnerAssistant(
     ai_service=ai_service,
     agent=bella_agent,
     reminders=reminder_service,
+    availability=availability_center,
+    refresh_presence=lambda: _set_presence(),
 )
 executive_assistant.owner_channel_id = owner_assistant.channel_id
 bella_agent.decision_checker = owner_assistant.check_decisions

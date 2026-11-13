@@ -21,6 +21,10 @@ tratada como falada com ela (`website_guard/owner_assistant.py`).
 | "dúvidas mais repetidas", "ideias de conteúdo" | Agrupa as perguntas da comunidade (últimos 30 dias) e sugere artigos. |
 | "ranking da staff" | Tickets atendidos, resolvidos e tempo médio da 1ª resposta. Enviado sozinho **dia 1 de cada mês**. |
 | "clientes sumidos" | Clientes (links de pagamento e tickets de orçamento) sem aparecer há 60+ dias, com rascunho de mensagem. **Nada é enviado sem ele responder "manda".** |
+| "vou ficar fora até dia 20", "vou viajar até 20/12", "férias até segunda" | **Modo viagem**: marca a ausência (quem te chama fica sabendo o dia da volta e pode deixar recado), muda o status da Bella e guarda tudo. "voltei" (ou automaticamente no dia seguinte à volta, 9h) entrega o resumo: menções (urgentes primeiro), recados, tickets/orçamentos, dinheiro e tarefas. |
+| "ideia: fazer curso de bots" (no canal) | **Caixa de ideias**. "minhas ideias" lista. Dia 1 de cada mês (11h) ela pergunta quais tirar do papel: "a 1 e a 3" vira tarefa, "descarta a 2" arquiva. |
+| "Contabo vence dia 10 todo mês R$ 40" | **Contas a pagar**: lembra 2 dias antes, todo mês, uma vez por vencimento. "paguei a Contabo", "minhas contas", "remove a conta da Contabo". |
+| "o que eu tava fazendo?", "onde parei?" | Últimos pedidos da sessão, tarefas abertas nela e compromissos de hoje. Ao voltar depois de `OWNER_PAUSE_HOURS` (padrão 3 h) sem falar no canal, ela manda isso sozinha como "bem-vindo de volta". |
 
 Alertas automáticos no canal:
 
@@ -105,7 +109,8 @@ FreeLLMAPI (Cerebras, OpenRouter, Mistral, GitHub Models, NVIDIA).
 
 `bella_reminders`, `bella_reminder_delivery_logs`, `owner_decisions`,
 `owner_community_questions`, `owner_client_activity`, `owner_client_drafts`,
-`owner_member_leaves`, `owner_assistant_meta`, `bella_memory_audit`,
+`owner_member_leaves`, `owner_assistant_meta`, `owner_ideas`, `owner_bills`,
+`owner_activity_log`, `bella_memory_audit`,
 `jarvis_universal_knowledge`.
 
 ## Testes
