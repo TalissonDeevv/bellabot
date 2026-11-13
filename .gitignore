@@ -1,0 +1,20 @@
+.env
+.venv/
+data/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+playwright-report/
+test-results/
+*service-account*.json
+
+# Segredos e dados (vão no pacote privado bella-dados.tar.gz, nunca no repositório)
+.env.*
+!.env.example
+deploy/freellmapi/.env
+backups/
+logs/
+*.tar.gz
+*.zip
+*.corrupt-*

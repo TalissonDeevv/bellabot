@@ -1,0 +1,34 @@
+# FreeLLMAPI ao lado da Bella. A porta só abre em 127.0.0.1 (nada exposto na
+# internet). O painel é acessado por túnel SSH. A porta vem de .env
+# (FREELLMAPI_PORT), escolhida pelo instalar_servidor.sh.
+name: bella-freellmapi
+
+services:
+  freellmapi:
+    image: ghcr.io/tashfeenahmed/freellmapi:latest
+    container_name: bella-freellmapi
+    restart: unless-stopped
+    env_file: .env            # ENCRYPTION_KEY e FREELLMAPI_PORT
+    environment:
+      PORT: "3001"
+      NODE_ENV: production
+      NODE_OPTIONS: "--max-old-space-size=256"
+    ports:
+      - "127.0.0.1:${FREELLMAPI_PORT:-3001}:3001"
+    volumes:
+      - freellmapi-data:/app/server/data
+    mem_limit: 450m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  freellmapi-data:

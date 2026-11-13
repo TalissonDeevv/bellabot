@@ -1,0 +1,18 @@
+{
+  "enabled": false,
+  "logChannelId": 0,
+  "confidenceThreshold": 0.88,
+  "cacheEnabled": true,
+  "aiEnabled": true,
+  "maxImageBytes": 8388608,
+  "categories": [
+    "promoções falsas",
+    "cassinos fraudulentos",
+    "promessas de dinheiro fácil",
+    "saques falsificados",
+    "bônus e promo codes enganosos",
+    "golpes com criptomoedas",
+    "comprovantes de ganhos irreais",
+    "uso indevido de celebridades ou influenciadores"
+  ]
+}
