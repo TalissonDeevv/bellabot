@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import time
 import uuid
@@ -78,7 +79,10 @@ class PermanentKnowledgeCenter:
             "title": knowledge["category"],
         }
 
-    async def save_owner_fact(
+    AUDIT_SECTION = "bella_memory_audit"
+    SCOPES = ("GLOBAL", "GUILD", "USER", "PROJECT")
+
+    async def save_memory(
         self,
         *,
         title: str,
@@ -87,14 +91,33 @@ class PermanentKnowledgeCenter:
         links: list[str],
         raw: str,
         user_id: int,
+        scope: str = "GLOBAL",
+        guild_id: int | None = None,
+        subject_user_id: int | None = None,
+        project: str = "",
+        category: str = "informacao",
+        priority: int = 3,
+        expires_at: float | None = None,
+        entities: list[dict[str, Any]] | None = None,
+        origin: str = "",
+        key: str | None = None,
     ) -> dict[str, Any]:
-        """Guarda um fato já estruturado pela IA ("guarde isso" do proprietário).
+        """Guarda (ou atualiza) uma memória estruturada.
 
-        As palavras-chave entram como gatilhos: a busca acha a memória quando a
-        pergunta tem duas ou mais palavras dela (preço, livro, comprar...).
+        Escopos: GLOBAL (todas as conversas), GUILD (um servidor), USER (uma
+        pessoa) e PROJECT (um projeto). Só o proprietário grava fora de USER;
+        em USER cada pessoa só grava sobre si mesma. As palavras-chave viram
+        gatilhos de busca; as entidades do Discord ficam estruturadas.
         """
-        if user_id != OWNER_DISCORD_ID:
-            raise PermissionError("Somente o proprietário pode guardar memórias.")
+        scope = (scope or "GLOBAL").upper()
+        if scope not in self.SCOPES:
+            scope = "GLOBAL"
+        if scope == "USER":
+            subject_user_id = subject_user_id or user_id
+            if user_id != subject_user_id and not is_memory_admin(user_id):
+                raise PermissionError("Você só pode guardar memórias sobre você mesmo.")
+        elif not is_memory_admin(user_id):
+            raise PermissionError("Somente o proprietário pode guardar memórias gerais.")
         title = " ".join(str(title or "").split())[:80]
         answer = " ".join(str(answer or "").split())[:2000]
         if not title or not answer:
@@ -105,33 +128,75 @@ class PermanentKnowledgeCenter:
                 for item in [title, *keywords]
                 if normalize_text(item).strip()
             )
-        )[:20]
+        )[:24]
+        scope_tag = {
+            "GLOBAL": "",
+            "GUILD": f"g{guild_id}:",
+            "USER": f"u{subject_user_id}:",
+            "PROJECT": f"p{_safe_key(project)}:",
+        }[scope]
         record = {
-            "key": f"fato:{_safe_key(title)}",
+            "key": key or f"fato:{scope_tag}{_safe_key(title)}",
             "category": title,
             "description": answer,
             "links": list(dict.fromkeys(links))[:5],
             "triggers": triggers,
             "source": "owner_fact",
             "raw": str(raw or "")[:2000],
+            "scope": scope,
+            "memory_category": category,
+            "guild_id": guild_id,
+            "subject_user_id": subject_user_id,
+            "project": project,
+            "priority": max(1, min(5, int(priority or 3))),
+            "status": "active",
+            "expires_at": expires_at,
+            "entities": list(entities or []),
+            "created_by": user_id,
+            "origin": origin,
         }
+        existed = record["key"] in await self.state.get_section(self.KNOWLEDGE_SECTION)
         await self._upsert_knowledge(record)
+        await self._audit("update" if existed else "create", record["key"], user_id, scope)
         return record
 
-    async def find_owner_memories(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
-        """Memórias que combinam com a descrição ("o preço do livro")."""
+    async def save_owner_fact(self, **kwargs: Any) -> dict[str, Any]:
+        """Compatibilidade: memória GLOBAL do proprietário."""
+        return await self.save_memory(**kwargs)
+
+    async def _audit(self, action: str, key: str, user_id: int, scope: str = "") -> None:
+        entry = {"at": int(time.time()), "action": action, "key": key, "by": user_id, "scope": scope}
+
+        def mutate(section: dict[str, Any]) -> None:
+            values = list(section.get("log", []))
+            values.append(entry)
+            section["log"] = values[-500:]
+
+        await self.state.mutate_section(self.AUDIT_SECTION, mutate)
+
+    async def find_owner_memories(
+        self,
+        query: str,
+        limit: int = 3,
+        *,
+        guild_id: int | None = None,
+        user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Memórias que combinam com a descrição, com a pontuação de cada uma."""
         section = await self.state.get_section(self.KNOWLEDGE_SECTION)
         text = normalize_text(query)
         scored = []
         for key, value in section.items():
             if not isinstance(value, dict) or value.get("source") == "server_summary":
                 continue
+            if not _memory_visible(value, guild_id=guild_id, user_id=user_id, admin_view=True):
+                continue
             score = _knowledge_score(text, value)
             category = normalize_text(str(value.get("category", "")))
             if category and category in text:
                 score += 1.0
             if score > 0:
-                scored.append((score, {**value, "key": key}))
+                scored.append((score, {**value, "key": key, "_score": round(score, 3)}))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [value for _, value in scored[:limit]]
 
@@ -219,9 +284,10 @@ class PermanentKnowledgeCenter:
         ]
 
     async def remove_manual_knowledge(self, item_id: str, *, user_id: int) -> bool:
-        if user_id != OWNER_DISCORD_ID:
-            raise PermissionError("Somente o proprietário pode remover conhecimentos.")
         target = _safe_key(item_id)
+        own_personal = target.startswith(f"fato:u{int(user_id)}:")
+        if not (is_memory_admin(user_id) or own_personal):
+            raise PermissionError("Somente o proprietário pode remover conhecimentos.")
         removed = False
 
         def remove_item(section: dict[str, Any]) -> None:
@@ -232,6 +298,8 @@ class PermanentKnowledgeCenter:
 
         await self.state.mutate_section(self.KNOWLEDGE_SECTION, remove_item)
         await self.state.mutate_section(self.ORGANIZATION_SECTION, remove_item)
+        if removed:
+            await self._audit("delete", target, user_id)
         return removed
 
     async def handle_owner_instruction(
@@ -286,9 +354,15 @@ class PermanentKnowledgeCenter:
 
         return None
 
-    async def context_payload(self, message: str) -> list[dict[str, str]]:
-        entries: list[dict[str, str]] = []
-        entries.extend(await self._universal_context(message))
+    async def context_payload(
+        self,
+        message: str,
+        *,
+        guild_id: int | None = None,
+        user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        entries.extend(await self._universal_context(message, guild_id=guild_id, user_id=user_id))
         entries.extend(await self._organization_context(message))
         entries.extend(_cheetah_context(message))
         return entries[:8]
@@ -420,17 +494,30 @@ class PermanentKnowledgeCenter:
                 parts.append("Memória organizacional:\n" + "\n".join(items[:12]))
         return "\n\n".join(parts) if parts else "Ainda não tenho memórias permanentes registradas."
 
-    async def _universal_context(self, message: str) -> list[dict[str, str]]:
+    async def _universal_context(
+        self,
+        message: str,
+        *,
+        guild_id: int | None = None,
+        user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         section = await self.state.get_section(self.KNOWLEDGE_SECTION)
         if not section:
             return []
         text = normalize_text(message)
         scored: list[tuple[float, dict[str, Any]]] = []
+        now = time.time()
         for value in section.values():
             if not isinstance(value, dict):
                 continue
+            if not _memory_visible(value, guild_id=guild_id, user_id=user_id):
+                continue
             score = _knowledge_score(text, value)
             if score >= 0.36:
+                # Prioridade (1-5) e recência desempatam memórias parecidas.
+                score += (int(value.get("priority") or 3) - 3) * 0.05
+                age_days = (now - float(value.get("updated_at") or now)) / 86400
+                score += max(0.0, 0.05 - age_days * 0.001)
                 scored.append((score, value))
         scored.sort(key=lambda item: item[0], reverse=True)
         return [_knowledge_payload(value, score) for score, value in scored[:4]]
@@ -749,13 +836,58 @@ def _knowledge_payload(value: dict[str, Any], score: float) -> dict[str, str]:
         "type": "owner_memory",
         "source": str(value.get("source", "owner_memory")),
         "url": links[0] if links else "",
+        "entities": list(value.get("entities") or []),
         "content": (
             f"Categoria: {value.get('category', '')}\n"
             f"Descrição: {value.get('description', '')}\n"
             f"Links oficiais: {', '.join(links) if links else 'nenhum'}\n"
-            f"Relevância estimada: {score:.2f}"
+            + (
+                "Menções do Discord (escreva exatamente assim, nunca troque por nome "
+                f"ou link): {_entities_for_model(value.get('entities'))}\n"
+                if value.get("entities")
+                else ""
+            )
+            + f"Relevância estimada: {score:.2f}"
         ),
     }
+
+
+def is_memory_admin(user_id: int | None) -> bool:
+    """Proprietário fixo + IDs extras em BELLA_OWNER_IDS (separados por vírgula)."""
+    if not user_id:
+        return False
+    if int(user_id) == OWNER_DISCORD_ID:
+        return True
+    extra = {item.strip() for item in os.getenv("BELLA_OWNER_IDS", "").split(",") if item.strip()}
+    return str(int(user_id)) in extra
+
+
+def _memory_visible(
+    value: dict[str, Any],
+    *,
+    guild_id: int | None,
+    user_id: int | None,
+    admin_view: bool = False,
+) -> bool:
+    if value.get("status", "active") != "active":
+        return False
+    expires = value.get("expires_at")
+    if expires and float(expires) < time.time():
+        return False
+    scope = str(value.get("scope") or "GLOBAL").upper()
+    if scope == "GUILD":
+        return guild_id is None or int(value.get("guild_id") or 0) == int(guild_id)
+    if scope == "USER":
+        if admin_view and user_id is None:
+            return True
+        return user_id is not None and int(value.get("subject_user_id") or 0) == int(user_id)
+    return True
+
+
+def _entities_for_model(values: Any) -> str:
+    from website_guard.discord_entities import describe_for_model, entities_from_dicts
+
+    return describe_for_model(entities_from_dicts(values or []))
 
 
 def _looks_organization_query(text: str) -> bool:

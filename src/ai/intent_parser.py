@@ -88,6 +88,7 @@ EXECUTIVE_ACTIONS = (
     "knowledge_save",
     "knowledge_list",
     "knowledge_forget",
+    "knowledge_update",
     "none",
 )
 
@@ -108,6 +109,7 @@ AGENT_ACTIONS = (
     "knowledge_save",
     "knowledge_list",
     "knowledge_forget",
+    "knowledge_update",
 )
 # Ações que não entram como etapa de um plano encadeado.
 NON_CHAINABLE_ACTIONS = ("undo_last", "briefing", "payment_link_create", "stripe_setup", "audio_process")
@@ -517,6 +519,8 @@ def _looks_like_information_query(content: str) -> bool:
         "memoria",
         "memória",
         "guardado",
+        "atualiza",
+        "regra mudou",
         "guardou",
     )
     if any(term in cleaned for term in administrative):

@@ -265,9 +265,19 @@ _CODE_ONLY = re.compile(
 )
 
 
+_HIRE_INTENT = re.compile(
+    r"\b(?:contrat\w*|orcamento|orcament\w*|quanto (?:custa|cobra|sai|fica)|preco|"
+    r"valor|freela\w*|servico|alguem (?:pra|para|que)|voces? (?:faz|fazem)|"
+    r"o talisson (?:faz|cria|desenvolve))\b"
+)
+
+
 def looks_like_code_request(text: str) -> bool:
     """Pedido para a Bella escrever código, o que ela não faz no chat."""
     normalized = normalize_text(text)
+    if _HIRE_INTENT.search(normalized):
+        # "queria contratar alguém pra desenvolver um bot" é pedido de orçamento.
+        return False
     # O objeto tem que vir logo depois do verbo: "cria um bot", "faz um site".
     # Em "escrever um email avisando que o site atrasa", site é outro assunto.
     for verb in _CODE_CREATE_VERBS.finditer(normalized):

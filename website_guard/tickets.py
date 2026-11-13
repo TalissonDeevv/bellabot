@@ -25,6 +25,7 @@ from src.ai.personality_engine import CommunityPersonalityEngine
 
 from .embed_builder import DraftField, EmbedDraft, V2ContainerDraft, V2ItemDraft
 from .identity import OWNER_DISCORD_ID
+from .quote_intake import IntakeState, QuoteIntake, is_quote_category
 from .state import StateStore
 
 LOGGER = logging.getLogger(__name__)
@@ -569,6 +570,7 @@ class SmartTicketManager:
         self.service = service
         self.store = TicketStore(state)
         self.personality = CommunityPersonalityEngine()
+        self.quote_intake = QuoteIntake(service)
         self._views_registered = False
         self._thread_locks: dict[int, Any] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -688,6 +690,10 @@ class SmartTicketManager:
                     ai_resolved=False,
                 )
                 return True
+            if not record.get("human_first_response_at"):
+                record["human_first_response_at"] = datetime.now(timezone.utc).isoformat()
+                record["human_first_responder"] = message.author.id
+                await self.store.save_ticket(message.channel.id, record)
             if not record.get("human_assumed"):
                 record.update(
                     {
@@ -714,6 +720,9 @@ class SmartTicketManager:
             )
             await self.store.save_ticket(message.channel.id, record)
         if record.get("human_assumed"):
+            return True
+        if is_creator and _quote_intake_active(record):
+            await self._quote_turn(message, config)
             return True
         if not config.auto_attendance_enabled and not record.get("force_auto_attendance"):
             return True
@@ -811,7 +820,10 @@ class SmartTicketManager:
             reason=f"Ticket aberto por {interaction.user} ({interaction.user.id})",
         )
         await thread.add_user(interaction.user)
-        await self._add_team_members(thread, config, selected_category)
+        quote_ticket = is_quote_category(selected_category)
+        if not quote_ticket:
+            # Orçamento: a equipe só entra depois da entrevista, com o resumo pronto.
+            await self._add_team_members(thread, config, selected_category)
         now = datetime.now(timezone.utc)
         record = {
             "guild_id": interaction.guild.id,
@@ -835,11 +847,15 @@ class SmartTicketManager:
             "opening_channel_id": channel.id,
             "force_auto_attendance": bool(force_auto_attendance),
         }
+        intake_state = IntakeState(started_at=now.isoformat()) if quote_ticket else None
+        if intake_state is not None:
+            record["quote_intake"] = intake_state.to_dict()
         await self.store.save_ticket(thread.id, record)
         await self.store.mutate_metrics(interaction.guild.id, opened=1)
-        welcome = self._welcome_fallback(
-            interaction.user.display_name,
-            selected_category,
+        welcome = (
+            self.quote_intake.opening(interaction.user.display_name, intake_state)
+            if intake_state is not None
+            else self._welcome_fallback(interaction.user.display_name, selected_category)
         )
         embed = discord.Embed(
             title=f"Atendimento • {selected_category}",
@@ -858,7 +874,7 @@ class SmartTicketManager:
                 everyone=False,
             ),
         )
-        task = asyncio.create_task(
+        task = None if intake_state is not None else asyncio.create_task(
             self._refine_welcome(
                 welcome_message,
                 interaction.user.display_name,
@@ -867,8 +883,9 @@ class SmartTicketManager:
                 context_instruction=context_instruction,
             )
         )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        if task is not None:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
         if self._ticket_open_handler is not None:
             try:
                 await self._ticket_open_handler(
@@ -951,7 +968,19 @@ class SmartTicketManager:
         thread, record, config = await self._interaction_ticket(interaction)
         if thread is None or record is None or config is None:
             return
-        if not self.member_can_manage_ticket(interaction.user, config, record) and not _record_has_minimum_context(record):
+        is_team = self.member_can_manage_ticket(interaction.user, config, record)
+        if _quote_intake_active(record) and not is_team:
+            await interaction.response.send_message(
+                "Assim que você terminar as perguntas do orçamento eu já chamo a equipe "
+                "com o resumo pronto. Falta pouco! ♡",
+                ephemeral=True,
+            )
+            return
+        if _quote_intake_active(record):
+            # Alguém da equipe pediu: encerra a entrevista e chama todo mundo.
+            record.setdefault("quote_intake", {})["finished"] = True
+            await self._add_team_members(thread, config, str(record.get("category", "")))
+        if not is_team and not _record_has_minimum_context(record):
             await interaction.response.send_message(
                 (
                     "Antes de encaminhar você para nossa equipe, preciso entender "
@@ -1582,6 +1611,74 @@ class SmartTicketManager:
                     exc,
                 )
         return fallback
+
+    async def _quote_turn(self, message: discord.Message, config: TicketConfig) -> None:
+        """Uma resposta do cliente na entrevista de orçamento."""
+        lock = self._thread_locks.setdefault(message.channel.id, asyncio.Lock())
+        async with lock:
+            record = await self.store.ticket(message.channel.id)
+            if not record or not _quote_intake_active(record):
+                return
+            if int(record.get("last_processed_message_id", 0)) == message.id:
+                return
+            state = IntakeState.from_dict(record.get("quote_intake"))
+            text = message.content or ""
+            if message.attachments:
+                text += "\n" + "\n".join(f"(anexo: {a.filename} {a.url})" for a in message.attachments[:5])
+            async with message.channel.typing():
+                result = await self.quote_intake.handle(text, state)
+            now = datetime.now(timezone.utc)
+            record["quote_intake"] = state.to_dict()
+            record["last_processed_message_id"] = message.id
+            record["updated_at"] = now.isoformat()
+            if not record.get("first_response_at"):
+                record["first_response_at"] = now.isoformat()
+            await self.store.save_ticket(message.channel.id, record)
+            if result.reply:
+                for part in _split_text(result.reply, 1900):
+                    await message.channel.send(part, allowed_mentions=discord.AllowedMentions.none())
+            if result.finished:
+                await self._finish_quote(message.channel, record, config, state, message.author.display_name)
+
+    async def _finish_quote(
+        self,
+        thread: discord.Thread,
+        record: dict[str, Any],
+        config: TicketConfig,
+        state: IntakeState,
+        client_name: str,
+    ) -> None:
+        summary = await self.quote_intake.summary(state, client_name)
+        document = self.quote_intake.answers_document(state, client_name)
+        embed = discord.Embed(
+            title=f"Resumo administrativo • {str(summary.get('titulo', 'Orçamento'))[:200]}",
+            description=str(summary.get("resumo", ""))[:3500],
+            color=discord.Color(config.color),
+            timestamp=datetime.now(timezone.utc),
+        )
+        for name, key in (("Escopo", "escopo"), ("Orçamento e prazo", "orcamento_prazo"),
+                          ("Técnico", "tecnico"), ("Complexidade", "complexidade")):
+            if summary.get(key):
+                embed.add_field(name=name, value=str(summary[key])[:1024], inline=key == "complexidade")
+        for name, key in (("Pontos de atenção", "pontos_de_atencao"), ("Próximos passos", "proximos_passos")):
+            items = [str(item) for item in summary.get(key) or [] if str(item).strip()]
+            if items:
+                embed.add_field(name=name, value="\n".join(f"• {item}" for item in items)[:1024], inline=False)
+        if state.client_questions:
+            embed.add_field(
+                name="Dúvidas do cliente",
+                value="\n".join(f"• {item}" for item in state.client_questions)[:1024],
+                inline=False,
+            )
+        embed.set_footer(text="Respostas completas no arquivo anexado")
+        file = discord.File(io.BytesIO(document.encode("utf-8")), filename="respostas-orcamento.md")
+        await thread.send(embed=embed, file=file, allowed_mentions=discord.AllowedMentions.none())
+        record["summary"] = str(summary.get("resumo", ""))[:1000]
+        record["quote_summary"] = summary
+        record["triage_complete"] = True
+        await self.store.save_ticket(thread.id, record)
+        await self._add_team_members(thread, config, str(record.get("category", "")))
+        await self._escalate(thread, record, config, requested=True)
 
     async def _escalate(
         self,
@@ -3831,6 +3928,28 @@ def _message_has_useful_context(message: str) -> bool:
             "proposta",
         )
     )
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        while len(line) > limit:
+            parts.append(line[:limit])
+            line = line[limit:]
+        if len(current) + len(line) + 1 > limit:
+            parts.append(current)
+            current = line
+        else:
+            current = f"{current}\n{line}" if current else line
+    if current:
+        parts.append(current)
+    return [part for part in parts if part.strip()]
+
+
+def _quote_intake_active(record: dict[str, Any]) -> bool:
+    intake = record.get("quote_intake")
+    return isinstance(intake, dict) and not intake.get("finished")
 
 
 def _record_has_minimum_context(record: dict[str, Any]) -> bool:

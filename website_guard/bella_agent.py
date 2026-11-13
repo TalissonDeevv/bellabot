@@ -26,6 +26,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 from unicodedata import combining, normalize
 from zoneinfo import ZoneInfo
@@ -40,6 +41,14 @@ from src.ai.audio_transcriber import (
     process_audio,
 )
 
+from src.ai.permanent_memory import is_memory_admin
+
+from .discord_entities import (
+    entities_from_dicts,
+    extract_entities,
+    render_mentions,
+    resolve_by_name,
+)
 from .executive import (
     ACTION_LABELS,
     ExecutiveAssistant,
@@ -68,6 +77,7 @@ MOD_ALERT_COOLDOWN_SECONDS = 30 * 60
 
 # Ações que nunca entram no histórico de "desfaz"/"faz o mesmo".
 NOT_RECORDED = {
+    "knowledge_update",
     "knowledge_save",
     "knowledge_list",
     "knowledge_forget",
@@ -137,6 +147,7 @@ AGENT_LABELS = {
     "knowledge_save": "Guardar na memória",
     "knowledge_list": "Listar memórias",
     "knowledge_forget": "Esquecer memória",
+    "knowledge_update": "Atualizar memória",
 }
 
 
@@ -390,6 +401,7 @@ class BellaAgent:
             "knowledge_save": self._knowledge_save,
             "knowledge_list": self._knowledge_list,
             "knowledge_forget": self._knowledge_forget,
+            "knowledge_update": self._knowledge_update,
             "channel_access_grant": self._channel_access_grant,
             "channel_make_private": self._channel_make_private,
         }.items():
@@ -806,7 +818,7 @@ class BellaAgent:
 
     # -------------------------------------------------------------- reminder
     async def _reminder_set(self, message, request) -> ExecutiveOutcome:
-        if self.availability is None:
+        if self.availability is None and getattr(self, "reminders", None) is None:
             return self._fail("o módulo de lembretes não está disponível.")
         zone = agent_zone()
         try:
@@ -827,6 +839,22 @@ class BellaAgent:
             if not text and isinstance(reference.resolved, discord.Message):
                 text = f'"{_short(reference.resolved.content, 300)}"'
         text = text or "você pediu pra eu te lembrar disso"
+        reminders = getattr(self, "reminders", None)
+        if reminders is not None:
+            try:
+                await reminders.create(
+                    user_id=message.author.id,
+                    description=f"{text} {link}".strip(),
+                    event_at=when,
+                    guild_id=getattr(message.guild, "id", None),
+                    channel_id=message.channel.id,
+                    source_message_id=message.id,
+                )
+            except ValueError as exc:
+                return self._fail(f"não consegui agendar: {exc}.")
+            return self._ok(
+                f"fechado! te aviso por DM 5 minutinhos antes de {when.strftime('%d/%m às %H:%M')}: {_short(text, 120)}"
+            )
         await self.availability.create_deterministic_reminder(
             guild_id=message.guild.id,
             channel_id=message.channel.id,
@@ -949,71 +977,140 @@ class BellaAgent:
 
     # --------------------------------------------------------------- memória
     async def _knowledge_save(self, message, request) -> ExecutiveOutcome:
+        return await self.save_memory_from_message(message, request)
+
+    async def save_memory_from_message(
+        self,
+        message: Any,
+        request: ExecutiveRequest | None = None,
+        *,
+        personal: bool = False,
+    ) -> ExecutiveOutcome:
+        """'Guarde isso': extrai, resolve entidades, salva e só então confirma."""
         if self.knowledge is None:
             return self._fail("a memória não está disponível agora.")
-        content = message.content
-        links = re.findall(r"https?://[^\s<>()]+", content)
-        links += [f"<#{cid}>" for cid in re.findall(r"<#(\d+)>", content)]
-        # Extração dedicada sempre: o interpretador às vezes reconhece o pedido mas
-        # preenche os campos errados (ex.: título "book_price_info", sem
-        # palavras-chave), e aí ninguém acha a memória depois.
-        extracted = await self._structure_memory(content)
-        title = extracted.get("title") or request.name or request.memory_key
-        answer = extracted.get("answer") or request.text or request.memory_value
-        topic = ", ".join(extracted.get("keywords", [])) or request.topic
-        keywords = [item.strip() for item in re.split(r"[,;\n]", topic or "") if item.strip()]
+        content = str(getattr(message, "content", "") or "")
+        guild = getattr(message, "guild", None)
+        extracted = await self._structure_memory(content, personal=personal)
+        title = extracted.get("title") or (request.name if request else "") or (request.memory_key if request else "")
+        answer = extracted.get("answer") or (request.text if request else "") or (request.memory_value if request else "")
+        if not (title and answer):
+            return self._fail("não entendi o que é pra guardar. me fala de novo com mais detalhe?")
+        entities = extract_entities(content, guild)
+        for named in extracted.get("named_entities", []):
+            resolution = resolve_by_name(guild, named.get("type", ""), named.get("name", ""))
+            if resolution.ambiguous:
+                options = ", ".join(item.mention for item in resolution.candidates[:5])
+                return self._fail(
+                    f"achei mais de um {named.get('name')} aqui: {options}. qual deles? "
+                    "me manda de novo mencionando o certo."
+                )
+            if resolution.entity and all(e.entity_id != resolution.entity.entity_id for e in entities):
+                entities.append(resolution.entity)
+        links = [
+            link for link in re.findall(r"https?://[^\s<>()]+", content)
+            if "discord.com/channels/" not in link  # canal vira menção estruturada
+        ]
+        scope = "USER" if personal else extracted.get("scope", "GLOBAL")
+        if scope == "GUILD" and guild is None:
+            scope = "GLOBAL"
+        expires_days = extracted.get("expires_in_days") or 0
         try:
-            record = await self.knowledge.save_owner_fact(
+            record = await self.knowledge.save_memory(
                 title=title,
                 answer=answer,
-                keywords=keywords,
+                keywords=extracted.get("keywords") or [
+                    item.strip() for item in re.split(r"[,;\n]", (request.topic if request else "") or "") if item.strip()
+                ],
                 links=links,
                 raw=content,
                 user_id=message.author.id,
+                scope=scope,
+                guild_id=getattr(guild, "id", None),
+                subject_user_id=message.author.id if scope == "USER" else None,
+                project=extracted.get("project", ""),
+                category=extracted.get("category", "informacao"),
+                priority=extracted.get("priority", 3),
+                expires_at=time.time() + float(expires_days) * 86400 if expires_days else None,
+                entities=[entity.to_dict() for entity in entities],
+                origin=str(getattr(message, "jump_url", "") or ""),
             )
-        except (PermissionError, ValueError) as exc:
-            return self._fail(f"não consegui guardar: {exc}")
-        gatilhos = ", ".join(record["triggers"][1:7])
-        return self._ok(
-            f"guardado: **{record['category']}**.\n"
-            f"quando perguntarem sobre {gatilhos or record['category']}, eu respondo: "
-            f"{_short(record['description'], 300)}"
+        except PermissionError as exc:
+            return self._fail(str(exc))
+        except (ValueError, OSError) as exc:
+            return self._fail(f"não consegui guardar agora: {exc}")
+        confirmation = extracted.get("confirmation") or (
+            f"pode deixar! ♡ vou lembrar disso: {_short(record['description'], 240)}"
         )
+        return self._ok(render_mentions(confirmation, entities))
 
-    async def _structure_memory(self, content: str) -> dict[str, Any]:
+    async def _structure_memory(self, content: str, *, personal: bool = False) -> dict[str, Any]:
         if self.ai_service is None:
             return {}
+        scope_hint = (
+            "É uma informação pessoal de quem está falando: scope=user."
+            if personal
+            else "scope: global (vale para todas as conversas), guild (só neste servidor), "
+            "user (só sobre quem está falando) ou project (sobre um projeto específico)."
+        )
         try:
             data = await self.ai_service.generate_json(
-                "O dono do servidor pediu para a assistente Bella guardar esta "
-                "informação e usar ao responder outras pessoas:\n\n"
+                "Pediram para a assistente Bella guardar esta informação e usar depois:\n\n"
                 f"{content}\n\n"
-                "Extraia: title = título curto do assunto (ex.: 'Livro do Talisson'); "
-                "answer = o que a Bella deve responder, como instrução clara em "
-                "terceira pessoa, mantendo exatamente valores, links e canais; "
-                "keywords = 8 a 15 palavras-chave e perguntas curtas que alguém usaria, "
-                "com sinônimos (preço, quanto custa, valor, comprar...).",
+                "Extraia em json:\n"
+                "- title: título curto do assunto (ex.: 'Orçamentos de serviços');\n"
+                "- answer: o que a Bella deve fazer/responder, como instrução clara em "
+                "terceira pessoa, mantendo exatamente valores, links e menções <#id>/<@&id>;\n"
+                "- keywords: 10 a 18 palavras e frases curtas que alguém usaria ao tocar no "
+                "assunto, com sinônimos e verbos relacionados (ex.: orçamento, preço, "
+                "quanto custa, contratar, quero um bot, fazer site, desenvolver);\n"
+                f"- {scope_hint}\n"
+                "- category: regra_comercial, informacao, preferencia, contato, regra_servidor ou outro;\n"
+                "- priority: 1 a 5 (5 = regra importante);\n"
+                "- expires_in_days: número de dias até deixar de valer, ou 0 se não expira;\n"
+                "- project: nome do projeto se for sobre um, senão vazio;\n"
+                "- named_entities: cargos/canais citados só pelo nome (sem menção nem link), "
+                "como [{\"type\": \"role\"|\"text_channel\"|\"voice_channel\", \"name\": \"...\"}];\n"
+                "- confirmation: uma frase curta e natural da Bella, em primeira pessoa e no "
+                "feminino, confirmando o que vai lembrar (pode usar ♡ no máximo uma vez, sem "
+                "outros emojis).",
                 {
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
                         "answer": {"type": "string"},
                         "keywords": {"type": "array", "items": {"type": "string"}},
+                        "scope": {"type": "string"},
+                        "category": {"type": "string"},
+                        "priority": {"type": "integer"},
+                        "expires_in_days": {"type": "integer"},
+                        "project": {"type": "string"},
+                        "named_entities": {"type": "array", "items": {"type": "object"}},
+                        "confirmation": {"type": "string"},
                     },
-                    "required": ["title", "answer", "keywords"],
+                    "required": ["title", "answer", "keywords", "scope", "confirmation"],
                 },
-                max_output_tokens=600,
-                timeout_seconds=20,
+                max_output_tokens=900,
+                timeout_seconds=25,
                 use_cache=False,
             )
         except Exception:
             LOGGER.exception("Falha ao estruturar a memória.")
             return {}
         keywords = data.get("keywords")
+        named = data.get("named_entities")
+        scope = str(data.get("scope") or "global").upper()
         return {
             "title": str(data.get("title") or "").strip(),
             "answer": str(data.get("answer") or "").strip(),
             "keywords": [str(k) for k in keywords] if isinstance(keywords, list) else [],
+            "scope": scope if scope in {"GLOBAL", "GUILD", "USER", "PROJECT"} else "GLOBAL",
+            "category": str(data.get("category") or "informacao")[:40],
+            "priority": _safe_int(data.get("priority"), 3),
+            "expires_in_days": _safe_int(data.get("expires_in_days"), 0),
+            "project": str(data.get("project") or "")[:60],
+            "named_entities": [item for item in named if isinstance(item, dict)] if isinstance(named, list) else [],
+            "confirmation": str(data.get("confirmation") or "").strip()[:400],
         }
 
     async def _knowledge_list(self, message, request) -> ExecutiveOutcome:
@@ -1021,29 +1118,96 @@ class BellaAgent:
             return self._fail("a memória não está disponível agora.")
         items = [
             item
-            for item in await self.knowledge.list_manual_knowledge(limit=40)
+            for item in await self.knowledge.list_manual_knowledge(limit=60)
             if not str(item.get("id", "")).startswith("server-summary")
         ]
         if not items:
             return self._ok("ainda não tenho nada guardado.")
         lines = [
             f"{i}. **{item['title']}**: {_short(item['summary'], 110)}"
-            for i, item in enumerate(items[:20], start=1)
+            for i, item in enumerate(items[:25], start=1)
         ]
         return self._ok("o que eu tenho guardado:\n" + "\n".join(lines))
+
+    async def _pick_memory(self, message, query: str) -> tuple[dict[str, Any] | None, str]:
+        """Memória certa para atualizar/apagar; pergunta quando há dúvida."""
+        guild_id = getattr(getattr(message, "guild", None), "id", None)
+        matches = await self.knowledge.find_owner_memories(
+            query, limit=3, guild_id=guild_id,
+            user_id=None if is_memory_admin(message.author.id) else message.author.id,
+        )
+        if not matches:
+            return None, "não achei nenhuma memória sobre isso. pede pra eu listar o que tenho guardado."
+        if len(matches) > 1 and matches[1]["_score"] >= matches[0]["_score"] * 0.8:
+            options = "; ".join(f"**{item.get('category')}**" for item in matches[:3])
+            return None, f"achei mais de uma parecida: {options}. qual delas? me fala o nome."
+        return matches[0], ""
 
     async def _knowledge_forget(self, message, request) -> ExecutiveOutcome:
         if self.knowledge is None:
             return self._fail("a memória não está disponível agora.")
-        query = request.text or request.name or request.topic or message.content
-        matches = await self.knowledge.find_owner_memories(query, limit=1)
-        if not matches:
-            return self._fail("não achei nenhuma memória sobre isso. pede pra eu listar.")
-        target = matches[0]
-        await self.knowledge.remove_manual_knowledge(
-            str(target["key"]), user_id=message.author.id
+        target, question = await self._pick_memory(
+            message, request.text or request.name or request.topic or message.content
         )
-        return self._ok(f"esqueci: **{target.get('category', target['key'])}**.")
+        if target is None:
+            return self._fail(question)
+        try:
+            removed = await self.knowledge.remove_manual_knowledge(
+                str(target["key"]), user_id=message.author.id
+            )
+        except PermissionError as exc:
+            return self._fail(str(exc))
+        if not removed:
+            return self._fail("não consegui apagar essa memória agora.")
+        return self._ok(f"pronto, esqueci: **{target.get('category', target['key'])}**.")
+
+    async def _knowledge_update(self, message, request) -> ExecutiveOutcome:
+        if self.knowledge is None:
+            return self._fail("a memória não está disponível agora.")
+        target, question = await self._pick_memory(
+            message, request.name or request.topic or request.text or message.content
+        )
+        if target is None:
+            return self._fail(question)
+        combined = SimpleNamespace(
+            content=(
+                f"Memória atual ({target.get('category')}): {target.get('description')}\n"
+                f"Mudança pedida: {message.content}\n"
+                "Gere a versão ATUALIZADA completa da memória."
+            ),
+            guild=getattr(message, "guild", None),
+            author=message.author,
+            jump_url=getattr(message, "jump_url", ""),
+        )
+        extracted = await self._structure_memory(combined.content)
+        if not extracted.get("answer"):
+            return self._fail("não entendi a mudança. me fala de novo como ficou?")
+        entities = extract_entities(message.content, combined.guild) or entities_from_dicts(
+            target.get("entities") or []
+        )
+        try:
+            record = await self.knowledge.save_memory(
+                title=str(target.get("category")),
+                answer=extracted["answer"],
+                keywords=extracted.get("keywords") or list(target.get("triggers") or []),
+                links=list(target.get("links") or []),
+                raw=message.content,
+                user_id=message.author.id,
+                scope=str(target.get("scope") or "GLOBAL"),
+                guild_id=target.get("guild_id"),
+                subject_user_id=target.get("subject_user_id"),
+                project=str(target.get("project") or ""),
+                category=str(target.get("memory_category") or "informacao"),
+                priority=int(target.get("priority") or 3),
+                entities=[entity.to_dict() for entity in entities],
+                origin=str(getattr(message, "jump_url", "") or ""),
+                key=str(target["key"]),
+            )
+        except PermissionError as exc:
+            return self._fail(str(exc))
+        return self._ok(
+            render_mentions(f"atualizado: **{record['category']}**. agora: {_short(record['description'], 240)}", entities)
+        )
 
     # ------------------------------------------------------------ audio / reunião
     @staticmethod
@@ -1196,6 +1360,16 @@ class BellaAgent:
             f"cliente: {customer or 'não informado'}\n"
             "confere e confirma?"
         )
+        checker = getattr(self, "decision_checker", None)
+        if checker is not None:
+            try:
+                warning = await checker(
+                    f"aceitar o projeto e cobrar {format_brl(amount)} pelo serviço {service} ({customer or 'cliente'})"
+                )
+            except Exception:
+                warning = ""
+            if warning:
+                preview = f"⚠️ {warning}\n\n{preview}"
 
         async def create(interaction: discord.Interaction) -> str:
             link = await self.stripe.create_payment_link(
@@ -1617,6 +1791,13 @@ class BellaAgent:
     @staticmethod
     def _fail(text: str) -> ExecutiveOutcome:
         return ExecutiveOutcome(success=False, public_message=text, audit_reason=text)
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_dt(value: Any) -> datetime | None:

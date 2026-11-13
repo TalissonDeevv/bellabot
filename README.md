@@ -484,6 +484,16 @@ Tudo em linguagem natural, só para o proprietário, sem frase fixa:
   link. Se o cliente foi @mencionado, oferece mandar o link por DM. Configure
   `STRIPE_SECRET_KEY` (comece com `sk_test_`) e `STRIPE_CURRENCY`.
 
+## Agente do dono, orçamento por entrevista e lembretes por DM
+
+Detalhes em [docs/BELLA_AGENTE_DONO.md](docs/BELLA_AGENTE_DONO.md):
+
+- **Canal privado do dono**: conversa sem mencionar; agenda do dia sem IA, agenda falada por áudio, cofre de decisões, resumo da semana (sexta 20h), dúvidas mais repetidas da comunidade, ranking mensal da staff, clientes sumidos (com aprovação antes de enviar), alertas de saída em massa e canal parado.
+- **Ticket "Solicitar Orçamento"**: a Bella entrevista o cliente com o formulário de desenvolvimento (e o de bot de Discord, quando for o caso), recusa respostas só "sim/não" e entrega um resumo administrativo antes de chamar a equipe.
+- **Lembretes por DM** 5 minutos antes, persistentes, com fuso America/Recife.
+- **Memória com escopos** (GLOBAL/USER/GUILD/PROJECT) e **menções reais do Discord** com notificação restrita.
+- **FreeLLMAPI** com nova tentativa, backoff, prazo total, logs por chamada e mensagem única de instabilidade.
+
 ## FreeLLMAPI (IA grátis com vários provedores)
 
 A Bella pode usar a [FreeLLMAPI](https://github.com/tashfeenahmed/freellmapi), que

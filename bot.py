@@ -39,7 +39,11 @@ from website_guard.admin import AdminAudit
 from website_guard.activity_monitor import ServerActivityMonitor
 from website_guard.anti_scam import AntiScamVision, antiscam_status_embed
 from website_guard.autonomous_moderation import AutonomousModeration
+from src.ai.freellmapi_client import LLM_CONVERSATION_ID
 from website_guard.bella_agent import BellaAgent
+from website_guard.discord_entities import allowed_mention_ids, sanitize_model_mentions
+from website_guard.owner_assistant import OwnerAssistant
+from website_guard.reminder_service import ReminderService, looks_like_reminder_request
 from website_guard.automation import (
     AUTOMATIONS_SECTION,
     KnowledgeAutomationCenter,
@@ -507,6 +511,20 @@ bella_agent.install(
     parser=executive_intent_parser,
     moderation=autonomous_moderation,
 )
+# Lembretes persistentes com DM 5 minutos antes (America/Recife por padrão).
+reminder_service = ReminderService(bot, state, ai_service=ai_service)
+bella_agent.reminders = reminder_service
+# Assistente pessoal no canal privado do Talisson (conversa sem precisar mencionar).
+owner_assistant = OwnerAssistant(
+    bot,
+    state,
+    owner_id=settings.talisson_user_id,
+    ai_service=ai_service,
+    agent=bella_agent,
+    reminders=reminder_service,
+)
+executive_assistant.owner_channel_id = owner_assistant.channel_id
+bella_agent.decision_checker = owner_assistant.check_decisions
 automation_center = KnowledgeAutomationCenter(state, ai_service)
 english_learning = EnglishLearningManager(state, ai_service)
 
@@ -978,6 +996,8 @@ async def on_ready() -> None:
         )
         LOGGER.exception("Receptor HTTP de audiência não pôde ser iniciado")
     _start_task("site", site_monitor_worker())
+    _start_task("reminders", reminder_service.worker())
+    _start_task("owner_assistant", owner_assistant.worker())
     _start_task("feedbacks", feedback_monitor_worker())
     _start_task("changes", change_monitor_worker())
     if github_site_monitor.configured:
@@ -1654,6 +1674,10 @@ async def _handle_message(message: discord.Message) -> None:
         await bella_agent.observe_message(message)
     except Exception:
         LOGGER.exception("Falha ao registrar menção ao proprietário.")
+    try:
+        await owner_assistant.observe_message(message)
+    except Exception:
+        LOGGER.exception("Falha ao registrar atividade para o assistente do dono.")
 
     content = message.content.strip()
     spam_trap.observe(message)
@@ -1690,6 +1714,15 @@ async def _handle_message(message: discord.Message) -> None:
         if invoked and ai_allowed_here:
             await maintenance_center.reply_to_message(message)
         if ai_allowed_here:
+            return
+    if invoked and message.author.id == owner_assistant.owner_id:
+        try:
+            owner_reply = await owner_assistant.handle(message, clean_content or content)
+        except Exception:
+            LOGGER.exception("Falha no assistente do dono para a mensagem %s", message.id)
+            owner_reply = PUBLIC_CONTINGENCY_MESSAGE
+        if owner_reply:
+            await _reply_public(message, owner_reply)
             return
     if invoked and await _handle_owner_mass_mention_request(
         message,
@@ -1748,6 +1781,21 @@ async def _handle_message(message: discord.Message) -> None:
         and executive_assistant.is_owner(message.author.id)
         and re.search(r"\blembr", clean_content, flags=re.IGNORECASE)
     )
+    if (
+        ai_allowed_here
+        and (invoked or message.guild is None)
+        and not owner_reply_reminder
+        and looks_like_reminder_request(clean_content)
+    ):
+        try:
+            reminder_reply = await reminder_service.handle_natural(message, clean_content)
+        except Exception:
+            LOGGER.exception("Falha ao processar lembrete da mensagem %s", message.id)
+            reminder_reply = PUBLIC_CONTINGENCY_MESSAGE
+        if reminder_reply:
+            await _reply_public(message, reminder_reply)
+            return
+
     if (
         ai_allowed_here
         and not owner_reply_reminder
@@ -1851,6 +1899,36 @@ async def _handle_message(message: discord.Message) -> None:
     return
 
 async def _send_public_ai_reply(
+    message: discord.Message,
+    content: str,
+    *,
+    force_reply: bool = False,
+    retrying_pending_id: str | None = None,
+    show_typing: bool = True,
+) -> bool:
+    lock_key = (
+        getattr(message.guild, "id", 0),
+        getattr(message.channel, "id", 0),
+        message.author.id,
+    )
+    lock = _PUBLIC_CONVERSATION_LOCKS.setdefault(lock_key, asyncio.Lock())
+    # Uma resposta por vez em cada conversa (servidor, canal, pessoa): mensagens
+    # seguidas não se misturam nem gravam o histórico fora de ordem.
+    LLM_CONVERSATION_ID.set(":".join(str(part) for part in lock_key))
+    async with lock:
+        return await _send_public_ai_reply_locked(
+            message,
+            content,
+            force_reply=force_reply,
+            retrying_pending_id=retrying_pending_id,
+            show_typing=show_typing,
+        )
+
+
+_PUBLIC_CONVERSATION_LOCKS: dict[tuple[int, int, int], asyncio.Lock] = {}
+
+
+async def _send_public_ai_reply_locked(
     message: discord.Message,
     content: str,
     *,
@@ -1986,6 +2064,8 @@ async def _send_public_ai_reply_inner(
             message,
             result.answer,
             conversational_rhythm=result.staggered,
+            entities=tuple(getattr(result, "entities", ()) or ()),
+            from_model=True,
         )
         if sent and retrying_pending_id:
             await _clear_public_ai_reply(retrying_pending_id)
@@ -2878,7 +2958,16 @@ async def _reply_public(
     response: str,
     *,
     conversational_rhythm: bool = False,
+    entities: tuple = (),
+    from_model: bool = False,
 ) -> bool:
+    if from_model:
+        # Menções vindas da IA só ficam se existirem no servidor ou na memória validada.
+        response = sanitize_model_mentions(
+            response,
+            guild=message.guild,
+            allowed_ids={entity.entity_id for entity in entities},
+        )
     parts = [
         part
         for part in _split_discord_response(
@@ -2889,9 +2978,14 @@ async def _reply_public(
     ]
     if not parts:
         return False
+    mention_users, mention_roles = allowed_mention_ids(
+        author_id=message.author.id,
+        entities=entities,
+        guild=message.guild,
+    )
     allowed_mentions = discord.AllowedMentions(
-        users=True,
-        roles=True,
+        users=[discord.Object(user_id) for user_id in mention_users],
+        roles=[discord.Object(role_id) for role_id in mention_roles],
         everyone=False,
         replied_user=True,
     )
@@ -2931,10 +3025,15 @@ async def _send_public_failure_notice(message: discord.Message) -> None:
     await _reply_public(
         message,
         (
-            "Não consegui concluir essa resposta agora, mesmo depois de novas tentativas. "
-            "Tenta me chamar de novo em instantes, tá?"
+            PUBLIC_CONTINGENCY_MESSAGE
         ),
     )
+
+
+PUBLIC_CONTINGENCY_MESSAGE = (
+    "Ops, tive uma instabilidade ao processar sua mensagem. "
+    "Pode tentar novamente daqui a pouquinho? ♡"
+)
 
 
 def _public_immediate_fallback(
@@ -2948,21 +3047,7 @@ def _public_immediate_fallback(
         has_media,
         (reason or "motivo não informado")[:300],
     )
-    if has_media:
-        return random.choice(
-            (
-                "vi a imagem, mas minha cabeça travou antes de eu conseguir olhar direito. manda de novo daqui a pouco?",
-                "pera, nn consegui abrir isso agora kkkk tenta de novo daqui a pouquinho",
-            )
-        )
-    return random.choice(
-        (
-            "a-ah... me deu branco agora kkkk fala de novo daqui a pouquinho?",
-            "pera, travei aqui kkkk me chama de novo daqui a pouco",
-            "hmm, nn consegui pensar nisso agora. tenta de novo daqui a pouquinho?",
-            "socorro, me perdi kkkkk manda de novo daqui a pouco",
-        )
-    )
+    return PUBLIC_CONTINGENCY_MESSAGE
 
 
 def _drop_stale_public_social_retry(
@@ -3070,6 +3155,8 @@ def _split_discord_response(
 
 
 def _bot_invoked(message: discord.Message) -> bool:
+    if owner_assistant.is_owner_channel(message):
+        return True  # no canal privado do Talisson, toda mensagem dele é com a Bella
     if re.match(r"^\s*(?:bella|nyelle|jarvis)\b", message.content, flags=re.IGNORECASE):
         return True
     if executive_assistant.is_bot_mentioned(message):
@@ -3304,6 +3391,10 @@ async def on_member_join(member: discord.Member) -> None:
 @bot.event
 async def on_member_remove(member: discord.Member) -> None:
     await server_activity.member_left(member)
+    try:
+        await owner_assistant.member_left(member)
+    except Exception:
+        LOGGER.exception("Falha no alerta de saída em massa.")
     try:
         await partner_affiliates.handle_member_remove(member)
     except Exception:

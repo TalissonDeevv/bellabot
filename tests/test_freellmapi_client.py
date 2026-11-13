@@ -41,6 +41,7 @@ def _client(handler) -> tuple[FreeLLMAPIClient, list[httpx.Request]]:
         text_model="auto",
         json_model="auto:smart",
         vision_model="auto:vision",
+        backoff_base_seconds=0,
     )
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(recording))
     return client, seen
@@ -120,7 +121,49 @@ class FreeLLMAPIClientTests(unittest.IsolatedAsyncioTestCase):
         client.text_model = "a,b,c"
         with self.assertRaises(OpenAICompatError):
             await client.chat.completions.create(model="x", messages=[])
+        # Conexão recusada: tenta de novo no mesmo modelo (backoff), não nos outros.
+        self.assertEqual(len(seen), 1 + client.max_retries)
+
+    async def test_server_error_is_retried_with_backoff(self) -> None:
+        answers = iter([httpx.Response(503, json={"error": {"message": "ocupado"}}), _ok("voltou")])
+        client, seen = _client(lambda request: next(answers))
+        response = await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(response.choices[0].message.content, "voltou")
+        self.assertEqual(len(seen), 2)
+
+    async def test_short_retry_after_is_honored(self) -> None:
+        answers = iter([httpx.Response(429, json={"error": {"message": "calma"}}, headers={"retry-after": "0"}), _ok("ok")])
+        client, seen = _client(lambda request: next(answers))
+        response = await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(response.choices[0].message.content, "ok")
+        self.assertEqual(len(seen), 2)
+
+    async def test_auth_error_fails_fast(self) -> None:
+        client, seen = _client(lambda request: httpx.Response(401, json={"error": {"message": "chave"}}))
+        client.text_model = "a,b"
+        with self.assertRaises(OpenAICompatError) as caught:
+            await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(caught.exception.status_code, 401)
         self.assertEqual(len(seen), 1)
+
+    async def test_invalid_json_moves_to_next_model(self) -> None:
+        def handler(request):
+            if json.loads(request.content)["model"] == "a":
+                return httpx.Response(200, content=b"<html>proxy</html>")
+            return _ok("do b")
+
+        client, seen = _client(handler)
+        client.text_model = "a,b"
+        response = await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(response.choices[0].message.content, "do b")
+
+    async def test_total_deadline_stops_retries(self) -> None:
+        client, seen = _client(lambda request: httpx.Response(500, json={"error": {"message": "x"}}))
+        client.text_model = "a,b,c,d,e"
+        client.total_timeout_seconds = 0.0
+        with self.assertRaises(OpenAICompatError):
+            await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(len(seen), 0)
 
     async def test_quota_error_keeps_status_and_retry_after(self) -> None:
         client, _ = _client(
@@ -155,7 +198,7 @@ class FreeLLMAPIClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.last_provider, "groq")
         # Fora do ar: o próximo pedido vai direto para a Groq, sem esperar.
         await client.chat.completions.create(**kwargs)
-        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(seen), 1 + primary.max_retries)
         self.assertEqual(len(groq_calls), 2)
 
     async def test_without_groq_key_errors_surface(self) -> None:

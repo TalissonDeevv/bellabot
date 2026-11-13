@@ -12,6 +12,8 @@ from .bella_voice_guard import (
     is_generic_bella_response,
 )
 from .bella_ai_handler import BellaAIHandler
+from website_guard.discord_entities import entities_from_dicts, render_mentions
+
 from .complexity import (
     assess_generation_mode,
     is_playful_tease,
@@ -45,6 +47,8 @@ class PublicReply:
     source: str = "local"
     conversation_context: str = "conversation"
     staggered: bool = False
+    # Entidades do Discord vindas de memórias usadas na resposta (menções nativas).
+    entities: tuple = ()
 
 
 class PublicAssistant:
@@ -80,6 +84,9 @@ class PublicAssistant:
         self.permanent = PermanentKnowledgeCenter(state)
         self.music_memory = BellaMusicMemory(state)
         self.bella_handler = BellaAIHandler(service, state)
+        # Entidades das memórias usadas, por conversa (servidor, canal, usuário):
+        # chave por conversa evita misturar respostas simultâneas.
+        self._pending_entities: dict[tuple, tuple] = {}
         self.context = AIContextBuilder(
             knowledge,
             self.memory,
@@ -111,6 +118,12 @@ class PublicAssistant:
         operational_rules: list[str] | None = None,
         humor_allowed: bool = True,
     ) -> PublicReply:
+        if int(user_id or 0) == int(getattr(self.settings, "talisson_user_id", 0) or 0):
+            # Quem fala é o próprio Talisson: a Bella fala COM ele, não sobre ele.
+            display_name = (
+                f"{display_name} (é o próprio Talisson, seu criador; responda direto a ele, "
+                "em segunda pessoa, nunca 'o Talisson pode confirmar')"
+            )
         decision = self.router.classify(message)
         generation = assess_generation_mode(
             message,
@@ -128,7 +141,9 @@ class PublicAssistant:
                 site_related=False,
                 source="code_policy",
             )
-        if generation.social and await self._matches_owner_memory(message):
+        if generation.social and await self._matches_owner_memory(
+            message, guild_id=guild_id, user_id=user_id
+        ):
             # "quero comprar o livro" parece papo curto, mas o Talisson ensinou a
             # resposta: o modo conversa não consulta a memória, este sim.
             generation = replace(
@@ -284,7 +299,14 @@ class PublicAssistant:
                 style=style,
             )
         music_context = await self.music_memory.context_payload(message)
-        permanent_context = await self.permanent.context_payload(message)
+        permanent_context = await self.permanent.context_payload(
+            message, guild_id=guild_id, user_id=user_id
+        )
+        self._pending_entities[(guild_id, channel_id, user_id)] = tuple(
+            entity
+            for item in permanent_context
+            for entity in entities_from_dicts(item.get("entities") or [])
+        )
         specialized_context = [
             *music_context,
             *permanent_context,
@@ -603,9 +625,17 @@ class PublicAssistant:
             style=style,
         )
 
-    async def _matches_owner_memory(self, message: str) -> bool:
+    async def _matches_owner_memory(
+        self,
+        message: str,
+        *,
+        guild_id: int | None = None,
+        user_id: int | None = None,
+    ) -> bool:
         try:
-            payload = await self.permanent.context_payload(message)
+            payload = await self.permanent.context_payload(
+                message, guild_id=guild_id, user_id=user_id
+            )
         except Exception:
             return False
         return any(
@@ -655,6 +685,11 @@ class PublicAssistant:
             safe_answer = _neutral_social_reply(user_text, conflict=True)
         if not safe_answer:
             safe_answer = _neutral_social_reply(user_text)
+        entities = self._pending_entities.pop((guild_id, channel_id, user_id), ())
+        if entities and safe_answer:
+            # O modelo recebe as menções prontas, mas pode trocar por nome ou link;
+            # a aplicação garante a menção nativa clicável.
+            safe_answer = render_mentions(safe_answer, entities)
         await self.memory.append(
             guild_id,
             channel_id,
@@ -674,6 +709,7 @@ class PublicAssistant:
                 selected_style.short_rhythm
                 and selected_style.context in {"casual", "meme", "banter"}
             ),
+            entities=tuple(entities),
         )
 
     async def _social_ai_recovery(

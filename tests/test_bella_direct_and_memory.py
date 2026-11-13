@@ -106,11 +106,11 @@ class OwnerMemoryTests(unittest.IsolatedAsyncioTestCase):
                 owner_id=OWNER_DISCORD_ID, knowledge=assistant.permanent,
             )
             agent.install()
-            link = "https://discord.com/channels/1/2"
+            link = "https://discord.com/channels/1467976297689911377/1514971417651839197"
             message = SimpleNamespace(
                 content=f"se alguém querer saber quanto é o meu livro, diz que é 50 reais. pra comprar, vai nesse canal {link}. Guarde isso",
                 author=SimpleNamespace(id=OWNER_DISCORD_ID),
-                guild=SimpleNamespace(id=1),
+                guild=None,
                 channel=SimpleNamespace(id=2),
             )
             saved = await executive.handlers["knowledge_save"](
@@ -123,11 +123,14 @@ class OwnerMemoryTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             self.assertTrue(saved.success)
-            self.assertIn("Livro do Talisson", saved.public_message)
+            self.assertIn("R$ 50", saved.public_message)
+            # O link do canal vira menção nativa estruturada.
+            self.assertIn("<#1514971417651839197>", saved.public_message)
 
             payload = await assistant.permanent.context_payload("quanto custa o livro do talisson?")
             self.assertTrue(any("R$ 50" in item["content"] for item in payload))
-            self.assertIn(link, payload[0]["url"])
+            self.assertIn("<#1514971417651839197>", payload[0]["content"])
+            self.assertEqual(payload[0]["entities"][0]["entity_id"], 1514971417651839197)
             # Pergunta curta que antes caía em conversa sem memória.
             self.assertTrue(await assistant._matches_owner_memory("quero comprar o livro"))
 

@@ -696,8 +696,10 @@ class ExecutiveAssistant:
             message.guild.id,
             message.author.id,
         )
+        in_owner_channel = getattr(message.channel, "id", 0) == getattr(self, "owner_channel_id", -1)
         if (
             pending is None
+            and not in_owner_channel
             and not self.is_bot_mentioned(message)
             and not self._replies_to_bot(message)
             and not re.match(
