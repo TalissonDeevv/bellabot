@@ -107,7 +107,9 @@ set_env FREELLMAPI_API_KEY "`$k"
 set_env FREELLMAPI_ENABLED true
 sudo systemctl restart bella-bot
 "@ -replace "`r", ""
-    Invoke-Remoto "bash -s" $scriptRemoto | Out-Null
+    # O PowerShell 5.1 acrescenta \r ao mandar texto para o stdin do ssh;
+    # o tr remove do lado do servidor antes do bash ler.
+    Invoke-Remoto "tr -d '\r' | bash -s" $scriptRemoto | Out-Null
     $scriptRemoto = $null
     $unificada = $null
     Write-Host "Bella reiniciada. Conferindo..."
