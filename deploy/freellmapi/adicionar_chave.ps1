@@ -9,7 +9,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Ip,
     [ValidateSet("openrouter", "mistral", "nvidia", "cohere", "huggingface", "cloudflare",
-                 "cerebras", "groq", "google", "llm7", "siliconflow", "requesty", "zhipu", "ovh", "kilo")]
+                 "cerebras", "groq", "google", "llm7", "siliconflow", "requesty", "zhipu", "ovh", "kilo", "aihorde", "parallel", "keenable")]
     [string]$Plataforma,
     [switch]$Listar,
     [switch]$RedefinirSenha,
@@ -87,7 +87,7 @@ try {
     if ($Listar) { return }
 
     Write-Host ""
-    if (@("ovh", "kilo") -contains $Plataforma) {
+    if (@("ovh", "kilo", "aihorde", "parallel", "keenable") -contains $Plataforma) {
         # Provedores que funcionam sem conta: a FreeLLMAPI guarda um marcador "sem chave".
         if (@($chaves | Where-Object { $_.platform -eq $Plataforma }).Count -gt 0) { Write-Host "$Plataforma já estava ativa."; return }
         Invoke-Api POST "/api/keys" @{ platform = $Plataforma; label = "bella" } $token | Out-Null
