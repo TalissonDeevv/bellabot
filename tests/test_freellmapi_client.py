@@ -101,6 +101,17 @@ class FreeLLMAPIClientTests(unittest.IsolatedAsyncioTestCase):
             ["gemini-2.5-flash", "lento", "gpt-oss-120b"],
         )
 
+    async def test_empty_answer_moves_to_next_model(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            model = json.loads(request.content)["model"]
+            return _ok("" if model == "vazio" else "certo")
+
+        client, seen = _client(handler)
+        client.text_model = "vazio,gpt-oss-120b"
+        response = await client.chat.completions.create(model="x", messages=[])
+        self.assertEqual(response.choices[0].message.content, "certo")
+        self.assertEqual(len(seen), 2)
+
     async def test_model_list_stops_when_freellmapi_is_down(self) -> None:
         def down(request):
             raise httpx.ConnectError("recusado", request=request)
@@ -180,6 +191,20 @@ class SwitchTests(unittest.IsolatedAsyncioTestCase):
             client = await service._get_client()
             self.assertIsInstance(client, FallbackChatClient)
             self.assertIsNone(client.secondary)
+
+    async def test_direct_groq_is_off_unless_enabled(self) -> None:
+        from src.ai.groq_service import GroqService
+        from website_guard.state import StateStore
+
+        for flag, expect_groq in (("false", False), ("true", True)):
+            with tempfile.TemporaryDirectory() as directory, patch.dict(
+                os.environ,
+                {**ENABLED_ENV, "GROQ_API_KEY": "gsk_Ab3dEf6hIj9kLm2nOp5qRs8tUv1wXy4zAb7cDe0fGh2", "GROQ_ENABLED": "true",
+                 "FREELLMAPI_DIRECT_FALLBACK": flag},
+            ):
+                service = GroqService(SimpleNamespace(), StateStore(Path(directory) / "s.json"))
+                client = await service._get_client()
+                self.assertEqual(client.secondary is not None, expect_groq, flag)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ class GenerationMode:
     timeout_seconds: float
     use_cache: bool
     instruction: str
+    task: bool = False
 
 
 def assess_generation_mode(
@@ -26,6 +27,10 @@ def assess_generation_mode(
     humor_allowed: bool = True,
 ) -> GenerationMode:
     text = normalize_text(message)
+    if looks_like_task_request(text):
+        # "cria um código de um bot" tem poucas palavras e caía em conversa
+        # curta (88 tokens, sem histórico): a Bella só fazia perguntas.
+        return task_generation_mode()
     assessment = assess_social_intent(message)
     looks_social = _looks_social(message, text)
     social = humor_allowed and looks_social and not assessment.serious
@@ -219,6 +224,82 @@ def _looks_simple_request(message: str, text: str) -> bool:
             r"pode|consegue|tem|existe)\b",
             text,
         )
+    )
+
+
+_TASK_VERBS = re.compile(
+    r"\b(?:cri[ae]r?|cria|crie|faz(?:er)?|fa[cç]a|escrev[ae]r?|ger[ae]r?|mont[ae]r?|"
+    r"program[ae]r?|desenvolv[ae]r?|codific[ae]r?|traduz(?:ir)?|traduza|corrig[ei]r?|"
+    r"corrija|revis[ae]r?|refator[ae]r?|otimiz[ae]r?|implement[ae]r?|adapt[ae]r?|"
+    r"converte[r]?|converta|resum[ae]r?|list[ae]r?|calcul[ae]r?|"
+    r"me (?:ajuda|ajude) (?:a|com|no|na|nesse|nessa))\b"
+)
+_TASK_OBJECTS = re.compile(
+    r"\b(?:codigo|script|bot|funcao|comando|classe|programa|site|pagina|api|"
+    r"html|css|javascript|typescript|python|py|java|sql|regex|query|planilha|"
+    r"formula|texto|email|mensagem|post|lista|tabela|resumo|traducao|exemplo|"
+    r"template|modelo|arquivo|json|yaml|dockerfile|readme)\b"
+)
+
+
+# Dois níveis, para não recusar perguntas normais ("a função do canal", "o bot
+# caiu", "preciso falar do bot"):
+# - verbo de CRIAR + algo programável (bot, site, função...);
+# - verbo de PEDIR + algo que só pode ser código (código, script, html...).
+_CODE_CREATE_VERBS = re.compile(
+    r"\b(?:cri[ae]r?|cria|crie|faz(?:er)?|fa[cç]a|escrev[ae]r?|ger[ae]r?|mont[ae]r?|"
+    r"program[ae]r?|desenvolv[ae]r?|codific[ae]r?|implement[ae]r?)\b"
+)
+_CODE_BUILDABLE = re.compile(
+    r"\b(?:codigo|codigos|script|scripts|bot|funcao|programa|site|pagina web|"
+    r"html|css|javascript|typescript|python|java|sql|regex|query|dockerfile|"
+    r"algoritmo|snippet|comando slash|slash command|api)\b"
+)
+_CODE_ASK_VERBS = re.compile(
+    r"\b(?:quero|preciso|me (?:passa|passe|manda|mande|envia|envie)|"
+    r"corrig[ei]r?|corrija|refator[ae]r?|complet[ae]|termin[ae])\b"
+)
+_CODE_ONLY = re.compile(
+    r"\b(?:codigo|codigos|script|scripts|html|css|javascript|typescript|sql|regex|"
+    r"dockerfile|snippet|trecho de codigo)\b"
+)
+
+
+def looks_like_code_request(text: str) -> bool:
+    """Pedido para a Bella escrever código, o que ela não faz no chat."""
+    normalized = normalize_text(text)
+    if _CODE_CREATE_VERBS.search(normalized) and _CODE_BUILDABLE.search(normalized):
+        return True
+    return bool(_CODE_ASK_VERBS.search(normalized) and _CODE_ONLY.search(normalized))
+
+
+def looks_like_task_request(text: str) -> bool:
+    """Pedido para produzir algo (código, texto, lista...), não papo casual."""
+    normalized = normalize_text(text)
+    if "```" in text:
+        return True
+    return bool(_TASK_VERBS.search(normalized) and _TASK_OBJECTS.search(normalized))
+
+
+def task_generation_mode() -> GenerationMode:
+    return GenerationMode(
+        complex=False,
+        social=False,
+        response_size="standard",
+        model_policy="balanced",
+        max_output_tokens=1500,
+        max_response_chars=6000,
+        timeout_seconds=15.0,
+        use_cache=False,
+        instruction=(
+            "Modo tarefa: faça agora o que foi pedido, usando o que já foi dito na "
+            "conversa. Não pergunte de novo algo que a pessoa já respondeu. Se faltar "
+            "um detalhe, assuma um padrão razoável, diga qual assumiu em uma linha e "
+            "entregue. Você não escreve código: se o pedido for código, diga isso em "
+            "uma frase. Só pergunte se for impossível fazer sem a resposta, e no "
+            "máximo uma vez. Se não conseguir fazer, diga isso em uma frase, sem enrolar."
+        ),
+        task=True,
     )
 
 

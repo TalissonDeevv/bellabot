@@ -84,6 +84,10 @@ EXECUTIVE_ACTIONS = (
     "channel_access_grant",
     "channel_make_private",
     "stripe_setup",
+    "audio_process",
+    "knowledge_save",
+    "knowledge_list",
+    "knowledge_forget",
     "none",
 )
 
@@ -100,13 +104,18 @@ AGENT_ACTIONS = (
     "channel_access_grant",
     "channel_make_private",
     "stripe_setup",
+    "audio_process",
+    "knowledge_save",
+    "knowledge_list",
+    "knowledge_forget",
 )
 # Ações que não entram como etapa de um plano encadeado.
-NON_CHAINABLE_ACTIONS = ("undo_last", "briefing", "payment_link_create", "stripe_setup")
+NON_CHAINABLE_ACTIONS = ("undo_last", "briefing", "payment_link_create", "stripe_setup", "audio_process")
 MAX_PLAN_STEPS = 5
 
-# Instruções (~5 mil caracteres) + catálogo filtrado cabem aqui sem corte.
-EXECUTIVE_PROMPT_CHAR_LIMIT = 9000
+# Instruções (~8 mil caracteres com as ações do agente) + catálogo filtrado
+# cabem aqui sem corte. O teste test_executive_natural garante isso.
+EXECUTIVE_PROMPT_CHAR_LIMIT = 12000
 _STOPWORDS = {
     "bella", "nyelle", "jarvis", "canal", "cargo", "para", "pra", "pro", "esse",
     "essa", "este", "esta", "isso", "aqui", "nesse", "nessa", "falando", "manda",
@@ -141,13 +150,17 @@ class GeminiIntentParser:
         current_channel_id: int | None = None,
         current_channel_name: str = "",
         current_channel_type: str = "",
+        attachments: list[str] | None = None,
     ) -> ExecutiveRequest | None:
         if not self.service.available:
             return None
+        attachments = list(attachments or [])
+        # Com alvo mencionado ou áudio anexado, a IA sempre decide.
         has_targets = bool(
             [uid for uid in mentioned_user_ids if uid != bot_user_id]
             or mentioned_role_ids
             or mentioned_channel_ids
+            or attachments
         )
         # Com alvo mencionado, a IA sempre decide: "sabe aquele @fulano? tira
         # ele daqui" começa como pergunta, mas é uma ordem.
@@ -210,6 +223,7 @@ class GeminiIntentParser:
                 },
                 recent_actions=recent_actions,
                 now_text=_now_text(),
+                attachments=attachments,
             ),
             _intent_schema(),
             max_output_tokens=1500,
@@ -497,6 +511,13 @@ def _looks_like_information_query(content: str) -> bool:
         "link de pag",
         "fatura",
         "stripe",
+        "esquece",
+        "esqueca",
+        "esqueça",
+        "memoria",
+        "memória",
+        "guardado",
+        "guardou",
     )
     if any(term in cleaned for term in administrative):
         return False

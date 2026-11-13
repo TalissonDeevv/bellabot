@@ -67,7 +67,7 @@ fi
 echo "==> 2/7 Pacotes"
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-  python3-venv python3-pip libopus0 openssl sqlite3 git
+  python3-venv python3-pip libopus0 openssl sqlite3 git ffmpeg
 if command -v docker >/dev/null 2>&1; then
   echo "   Docker já instalado; mantendo o que existe."
 else

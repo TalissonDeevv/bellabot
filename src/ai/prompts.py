@@ -456,10 +456,12 @@ def executive_intent_prompt(
     current_channel: dict[str, Any],
     recent_actions: list[dict[str, Any]] | None = None,
     now_text: str = "",
+    attachments: list[str] | None = None,
 ) -> str:
     return (
         f"ORDEM DO PROPRIETÁRIO: {content}\n"
         f"AGORA: {now_text or 'desconhecido'}\n"
+        f"ANEXOS (na mensagem ou na respondida): {json.dumps(list(attachments or []), ensure_ascii=False)}\n"
         f"ÚLTIMAS AÇÕES EXECUTADAS (mais recente primeiro): "
         f"{json.dumps(list(recent_actions or []), ensure_ascii=False)}\n\n"
         "Você é o interpretador de ordens administrativas do proprietário do "
@@ -509,6 +511,11 @@ def executive_intent_prompt(
         "('1500.00', '89.90'; 'mil e quinhentos'=1500.00, '1.500'=1500.00), "
         "name=serviço, text=nome do cliente como dito, target_id SÓ se o cliente "
         "foi @mencionado (um nome escrito não é membro).\n"
+        "- audio_process: quando houver ANEXO de áudio/vídeo e o pedido for "
+        "transcrever, resumir ou preparar orçamento/briefing ('faz o briefing dessa "
+        "reunião', 'resume isso', 'transcreve', 'o que ele falou?'). topic=briefing "
+        "(reunião com cliente ou orçamento; padrão se só mandou o áudio), resumo ou "
+        "transcricao.\n"
         "- stripe_setup: 'configura o stripe', 'o que precisa pro stripe?', "
         "'troca a chave do stripe'. Sem campos.\n"
         "- channel_access_grant: 'libera/dá acesso ao canal X pro cargo Y ou pro "
@@ -529,11 +536,20 @@ def executive_intent_prompt(
         "CONTINUIDADE: 'faz o mesmo com o @y', 'agora tira dele', 'de novo' "
         "se referem a ÚLTIMAS AÇÕES; reutilize ação e parâmetros trocando só o "
         "que mudou.\n\n"
-        "PERSISTÊNCIA:\n"
-        "Nunca salve conhecimento, memória ou regra permanente por conversa. "
-        "Pedidos para lembrar, registrar, ensinar ou definir política permanente "
-        'devem retornar action="none"; esses recursos só podem ser cadastrados '
-        "pelos comandos dedicados do Discord.\n\n"
+        "MEMÓRIA (o proprietário ensina a Bella):\n"
+        "- knowledge_save: quando ele pedir para guardar/lembrar/memorizar/anotar uma "
+        "informação para a Bella usar ao responder outras pessoas ('se alguém "
+        "perguntar X, diz Y. guarde isso'). name=título curto do assunto ('Livro do "
+        "Talisson'); text=o que a Bella deve responder, como instrução clara, "
+        "preservando exatamente valores, links, canais e condições ('O livro do "
+        "Talisson custa R$ 50. Para comprar, a pessoa deve ir no canal <link>.'); "
+        "topic=8 a 15 palavras-chave e perguntas curtas separadas por vírgula que "
+        "alguém usaria, com sinônimos ('livro, preço do livro, quanto custa o livro, "
+        "valor, comprar livro, onde compro'). Não confunda com lembrete de horário "
+        "(reminder_set) nem com tarefa pessoal (todo_add).\n"
+        "- knowledge_list: 'o que vc tem guardado?', 'quais memórias vc tem?'.\n"
+        "- knowledge_forget: 'esquece o preço do livro', 'apaga a memória do X'. "
+        "text=descrição do que esquecer.\n\n"
         "ESTATÍSTICAS AUTOMÁTICAS:\n"
         "- statistics_schedule_set: configurar publicação recorrente de um painel "
         "de estatísticas em canal. Extraia statistics_type entre site, servidor, "

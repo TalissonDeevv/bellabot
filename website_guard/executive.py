@@ -725,6 +725,7 @@ class ExecutiveAssistant:
                 request = await self.intent_resolver(
                     message.content,
                     guild_id=message.guild.id,
+                    attachments=_attachment_summary(message),
                     **ai_context,
                 )
             except Exception as exc:
@@ -3027,6 +3028,20 @@ class ExecutiveAssistant:
             roles=roles,
             notes=notes,
         )
+
+
+def _attachment_summary(message: discord.Message) -> list[str]:
+    """Nome, tipo e tamanho dos anexos da mensagem e da mensagem respondida."""
+    attachments = list(getattr(message, "attachments", []) or [])
+    reference = getattr(message, "reference", None)
+    resolved = getattr(reference, "resolved", None) if reference else None
+    if isinstance(resolved, discord.Message):
+        attachments += list(resolved.attachments)
+    return [
+        f"{item.filename} ({item.content_type or 'tipo desconhecido'}, "
+        f"{item.size / (1024 * 1024):.1f} MB)"
+        for item in attachments[:5]
+    ]
 
 
 _COMPOUND_VERBS = re.compile(

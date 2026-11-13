@@ -16,9 +16,11 @@ natural em um ExecutiveRequest, que pode ter várias etapas. Este módulo:
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
+import tempfile
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -30,6 +32,13 @@ from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
+
+from src.ai.audio_transcriber import (
+    TranscriptionError,
+    is_audio_attachment,
+    normalize_mode,
+    process_audio,
+)
 
 from .executive import (
     ACTION_LABELS,
@@ -47,6 +56,7 @@ INBOX_SECTION = "agent_inbox"
 META_SECTION = "agent_meta"
 MOD_ALERT_SECTION = "agent_moderation_alerts"
 PAYMENT_SECTION = "agent_payment_links"
+MEETING_SECTION = "agent_meetings"
 TICKET_SECTION = "smart_tickets"
 REMINDER_SECTION = "talisson_personal_reminders"
 
@@ -58,6 +68,10 @@ MOD_ALERT_COOLDOWN_SECONDS = 30 * 60
 
 # Ações que nunca entram no histórico de "desfaz"/"faz o mesmo".
 NOT_RECORDED = {
+    "knowledge_save",
+    "knowledge_list",
+    "knowledge_forget",
+    "audio_process",
     "undo_last",
     "briefing",
     "todo_add",
@@ -119,6 +133,10 @@ AGENT_LABELS = {
     "channel_access_grant": "Liberar acesso ao canal",
     "channel_make_private": "Tornar canal privado",
     "stripe_setup": "Configurar Stripe",
+    "audio_process": "Transcrever/resumir áudio",
+    "knowledge_save": "Guardar na memória",
+    "knowledge_list": "Listar memórias",
+    "knowledge_forget": "Esquecer memória",
 }
 
 
@@ -332,12 +350,18 @@ class BellaAgent:
         *,
         owner_id: int,
         availability: Any | None = None,
+        ai_service: Any | None = None,
+        knowledge: Any | None = None,
     ) -> None:
         self.bot = bot
         self.state = state
         self.executive = executive
         self.owner_id = int(owner_id)
         self.availability = availability
+        self.ai_service = ai_service
+        self.knowledge = knowledge
+        self._audio_lock = asyncio.Semaphore(1)
+        self._audio_tasks: set[asyncio.Task] = set()
         self.stripe = StripeClient(
             os.getenv("STRIPE_SECRET_KEY", ""),
             currency=os.getenv("STRIPE_CURRENCY", "brl"),
@@ -362,6 +386,10 @@ class BellaAgent:
             "poll_create": self._poll_create,
             "payment_link_create": self._payment_unconfirmed,
             "stripe_setup": self._payment_unconfirmed,
+            "audio_process": self._audio_process,
+            "knowledge_save": self._knowledge_save,
+            "knowledge_list": self._knowledge_list,
+            "knowledge_forget": self._knowledge_forget,
             "channel_access_grant": self._channel_access_grant,
             "channel_make_private": self._channel_make_private,
         }.items():
@@ -918,6 +946,170 @@ class BellaAgent:
             message.guild.default_role, view_channel=False, reason=reason
         )
         return self._ok(f"#{channel.name} agora é privado.")
+
+    # --------------------------------------------------------------- memória
+    async def _knowledge_save(self, message, request) -> ExecutiveOutcome:
+        if self.knowledge is None:
+            return self._fail("a memória não está disponível agora.")
+        content = message.content
+        links = re.findall(r"https?://[^\s<>()]+", content)
+        links += [f"<#{cid}>" for cid in re.findall(r"<#(\d+)>", content)]
+        keywords = [item.strip() for item in re.split(r"[,;\n]", request.topic or "") if item.strip()]
+        try:
+            record = await self.knowledge.save_owner_fact(
+                title=request.name,
+                answer=request.text,
+                keywords=keywords,
+                links=links,
+                raw=content,
+                user_id=message.author.id,
+            )
+        except (PermissionError, ValueError) as exc:
+            return self._fail(f"não consegui guardar: {exc}")
+        gatilhos = ", ".join(record["triggers"][1:7])
+        return self._ok(
+            f"guardado: **{record['category']}**.\n"
+            f"quando perguntarem sobre {gatilhos or record['category']}, eu respondo: "
+            f"{_short(record['description'], 300)}"
+        )
+
+    async def _knowledge_list(self, message, request) -> ExecutiveOutcome:
+        if self.knowledge is None:
+            return self._fail("a memória não está disponível agora.")
+        items = [
+            item
+            for item in await self.knowledge.list_manual_knowledge(limit=40)
+            if not str(item.get("id", "")).startswith("server-summary")
+        ]
+        if not items:
+            return self._ok("ainda não tenho nada guardado.")
+        lines = [
+            f"{i}. **{item['title']}**: {_short(item['summary'], 110)}"
+            for i, item in enumerate(items[:20], start=1)
+        ]
+        return self._ok("o que eu tenho guardado:\n" + "\n".join(lines))
+
+    async def _knowledge_forget(self, message, request) -> ExecutiveOutcome:
+        if self.knowledge is None:
+            return self._fail("a memória não está disponível agora.")
+        query = request.text or request.name or request.topic or message.content
+        matches = await self.knowledge.find_owner_memories(query, limit=1)
+        if not matches:
+            return self._fail("não achei nenhuma memória sobre isso. pede pra eu listar.")
+        target = matches[0]
+        await self.knowledge.remove_manual_knowledge(
+            str(target["key"]), user_id=message.author.id
+        )
+        return self._ok(f"esqueci: **{target.get('category', target['key'])}**.")
+
+    # ------------------------------------------------------------ audio / reunião
+    @staticmethod
+    def _audio_attachment(message: discord.Message) -> discord.Attachment | None:
+        candidates = list(message.attachments)
+        reference = message.reference
+        if reference is not None and isinstance(reference.resolved, discord.Message):
+            candidates += list(reference.resolved.attachments)
+        for attachment in candidates:
+            if is_audio_attachment(attachment.filename, attachment.content_type):
+                return attachment
+        return None
+
+    async def _audio_process(self, message, request) -> ExecutiveOutcome:
+        if self.ai_service is None:
+            return self._fail("a transcrição não está disponível agora.")
+        attachment = self._audio_attachment(message)
+        if attachment is None:
+            return self._fail(
+                "não achei áudio. manda o arquivo junto com o pedido ou responde "
+                "a mensagem que tem o áudio."
+            )
+        mode = normalize_mode(request.topic or request.name or request.text)
+        label = {"briefing": "o briefing do orçamento", "resumo": "o resumo",
+                 "transcricao": "a transcrição"}[mode]
+        task = asyncio.create_task(self._run_audio_job(message, attachment, mode))
+        self._audio_tasks.add(task)
+        task.add_done_callback(self._audio_tasks.discard)
+        size_mb = attachment.size / (1024 * 1024)
+        waiting = " (tem outro na fila, faço logo depois)" if self._audio_lock.locked() else ""
+        return self._ok(
+            f"recebi o áudio ({attachment.filename}, {size_mb:.1f} MB). tô ouvindo "
+            f"e te mando {label} no privado quando terminar{waiting}."
+        )
+
+    async def _run_audio_job(
+        self,
+        message: discord.Message,
+        attachment: discord.Attachment,
+        mode: str,
+    ) -> None:
+        async with self._audio_lock:
+            started = time.monotonic()
+            try:
+                with tempfile.TemporaryDirectory(prefix="bella-audio-") as folder:
+                    workdir = Path(folder)
+                    source = workdir / ("original" + (Path(attachment.filename).suffix or ".bin"))
+                    await attachment.save(source)
+                    result = await process_audio(self.ai_service, source, workdir, mode)
+            except TranscriptionError as exc:
+                await self._dm_owner(f"não consegui processar {attachment.filename}: {exc}")
+                return
+            except Exception as exc:
+                LOGGER.exception("Falha ao processar áudio %s.", attachment.filename)
+                await self._dm_owner(
+                    f"deu erro processando {attachment.filename} ({type(exc).__name__})."
+                )
+                return
+            minutes = (time.monotonic() - started) / 60
+            await self._save_meeting(message, attachment.filename, result)
+            header = {
+                "briefing": "**Briefing para orçamento**",
+                "resumo": "**Resumo do áudio**",
+                "transcricao": "**Transcrição**",
+            }[result.mode]
+            text = (
+                f"{header} — {attachment.filename}\n"
+                f"(ouvi {result.parts} parte(s) de até 10 min em {minutes:.1f} min; "
+                "transcrição completa em anexo)\n\n"
+                f"{result.document}"
+            ).strip()
+            await self._dm_owner_with_file(
+                text,
+                result.transcript,
+                Path(attachment.filename).stem + "-transcricao.txt",
+            )
+
+    async def _save_meeting(self, message, filename: str, result) -> None:
+        entry = {
+            "at": _now().isoformat(),
+            "file": filename,
+            "mode": result.mode,
+            "channel_id": message.channel.id,
+            "document": result.document[:8000],
+            "transcript_chars": len(result.transcript),
+        }
+
+        def mutate(section: dict[str, Any]) -> None:
+            values = list(section.get(str(message.guild.id), []))
+            values.append(entry)
+            section[str(message.guild.id)] = values[-30:]
+
+        await self.state.mutate_section(MEETING_SECTION, mutate)
+
+    async def _dm_owner_with_file(self, text: str, content: str, filename: str) -> bool:
+        try:
+            owner = self.bot.get_user(self.owner_id) or await self.bot.fetch_user(self.owner_id)
+            chunks = _split_message(text)
+            for chunk in chunks[:-1]:
+                await owner.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+            await owner.send(
+                chunks[-1],
+                file=discord.File(io.BytesIO(content.encode("utf-8")), filename=filename),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return True
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            LOGGER.warning("Não consegui mandar o resultado do áudio por DM.")
+            return False
 
     # --------------------------------------------------------------- payments
     async def _payment_unconfirmed(self, message, request) -> ExecutiveOutcome:

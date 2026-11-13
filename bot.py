@@ -500,6 +500,8 @@ bella_agent = BellaAgent(
     executive_assistant,
     owner_id=settings.talisson_user_id,
     availability=availability_center,
+    ai_service=ai_service,
+    knowledge=public_assistant.permanent,
 )
 bella_agent.install(
     parser=executive_intent_parser,

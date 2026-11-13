@@ -93,6 +93,20 @@ class CommunityPersonalityEngine:
         user_message: str,
         style: ConversationStyle,
     ) -> str:
+        if "```" in answer:
+            # Ajustes de estilo só no texto; dentro de bloco de código, abreviar
+            # "você" ou mexer em numeração quebraria o programa.
+            parts = re.split(r"(```.*?(?:```|$))", answer, flags=re.S)
+            rebuilt: list[str] = []
+            for part in parts:
+                if part.startswith("```") or not part.strip():
+                    rebuilt.append(part)
+                    continue
+                lead = part[: len(part) - len(part.lstrip())]
+                trail = part[len(part.rstrip()):]
+                core = self.adapt(part.strip(), user_message=user_message, style=style)
+                rebuilt.append(f"{lead}{core}{trail}")
+            return "".join(rebuilt).strip()
         text = _remove_ai_voice(answer)
         text = _remove_unrequested_numbering(text, user_message)
         if style.abbreviation_level > 0:

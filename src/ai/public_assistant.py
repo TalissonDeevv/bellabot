@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from website_guard.config import Settings
 from website_guard.knowledge import KnowledgeBase
@@ -12,7 +12,13 @@ from .bella_voice_guard import (
     is_generic_bella_response,
 )
 from .bella_ai_handler import BellaAIHandler
-from .complexity import assess_generation_mode, is_playful_tease
+from .complexity import (
+    assess_generation_mode,
+    is_playful_tease,
+    looks_like_code_request,
+    looks_like_task_request,
+    task_generation_mode,
+)
 from .context import AIContextBuilder
 from .groq_service import GroqService, MediaInput
 from .intent_router import IntentDecision, IntentRouter, normalize_text
@@ -111,6 +117,35 @@ class PublicAssistant:
             humor_allowed=humor_allowed,
         )
         recent = list(recent_context or ())[-20:]
+        if looks_like_code_request(message) or _follows_code_request(message, recent):
+            # A Bella não escreve código no chat: avisa direto, sem gastar IA.
+            await self.memory.observe_user_message(guild_id, user_id, message)
+            return PublicReply(
+                should_reply=True,
+                answer=_code_refusal(message),
+                intent="conversation",
+                confidence=1.0,
+                site_related=False,
+                source="code_policy",
+            )
+        if generation.social and await self._matches_owner_memory(message):
+            # "quero comprar o livro" parece papo curto, mas o Talisson ensinou a
+            # resposta: o modo conversa não consulta a memória, este sim.
+            generation = replace(
+                task_generation_mode(),
+                instruction=(
+                    "Responda usando a memória que o Talisson ensinou (na base "
+                    "especializada), com os valores, links e canais exatamente como "
+                    "estão. Curto e direto."
+                ),
+                max_output_tokens=400,
+                timeout_seconds=6.0,
+                task=False,
+            )
+        if not generation.task and _continues_pending_task(message, recent):
+            # "python", "quero", "um bot simples de py" respondendo a uma pergunta
+            # da Bella ou logo após um pedido: é continuação da tarefa, não papo.
+            generation = task_generation_mode()
         style = self.personality.analyze(
             message,
             recent_context=recent,
@@ -349,14 +384,24 @@ class PublicAssistant:
                                     )
                                 ),
                             ),
-                            max_output_tokens=min(generation.max_output_tokens, 360),
-                            timeout_seconds=min(generation.timeout_seconds, 3.8),
+                            max_output_tokens=(
+                                generation.max_output_tokens
+                                if generation.task
+                                else min(generation.max_output_tokens, 360)
+                            ),
+                            timeout_seconds=(
+                                generation.timeout_seconds
+                                if generation.task
+                                else min(generation.timeout_seconds, 3.8)
+                            ),
                             model_policy="economy",
                             use_cache=generation.use_cache,
                         ),
                         complex_mode=False,
                     ),
-                    min(generation.max_response_chars, 1800),
+                    generation.max_response_chars
+                    if generation.task
+                    else min(generation.max_response_chars, 1800),
                 )
             except Exception as exc:
                 await self.state.set(
@@ -558,6 +603,16 @@ class PublicAssistant:
             style=style,
         )
 
+    async def _matches_owner_memory(self, message: str) -> bool:
+        try:
+            payload = await self.permanent.context_payload(message)
+        except Exception:
+            return False
+        return any(
+            item.get("type") == "owner_memory" and item.get("source") == "owner_fact"
+            for item in payload
+        )
+
     async def _finalize(
         self,
         user_text: str,
@@ -578,6 +633,9 @@ class PublicAssistant:
             recent_context=[],
             humor_allowed=False,
         )
+        if "```" in answer:
+            # Trava: a Bella não escreve código no chat, venha de onde vier.
+            answer = _code_refusal(user_text)
         adapted_answer = self.personality.adapt(
             answer,
             user_message=user_text,
@@ -653,6 +711,61 @@ class PublicAssistant:
         if deescalate:
             return _neutral_social_reply(message, conflict=True)
         return ""
+
+
+_GREETING_ONLY = {
+    "oi", "oii", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem", "obrigado",
+    "obrigada", "valeu", "vlw", "tchau", "kkkk", "kkkkk", "ok", "blz", "beleza",
+}
+
+
+_CODE_REFUSALS = (
+    "não faço código por aqui. se for um projeto, abre um ticket que o Talisson vê com vc.",
+    "código eu não escrevo no chat. se for projeto, o caminho é abrir um ticket com o Talisson.",
+    "isso eu não faço: código não sai pelo chat. pra projeto, abre um ticket.",
+)
+
+
+def _code_refusal(message: str) -> str:
+    return _CODE_REFUSALS[sum(map(ord, message)) % len(_CODE_REFUSALS)]
+
+
+def _follows_code_request(message: str, recent: list[dict[str, str]]) -> bool:
+    """'python', 'quero', 'sim' logo depois de um pedido de código."""
+    text = normalize_text(message).strip(" ?!.,")
+    if not text or "?" in message or len(text.split()) > 6 or text in _GREETING_ONLY:
+        return False
+    user_turns = [
+        str(item.get("text", ""))
+        for item in reversed(recent[-6:])
+        if not any(
+            name in normalize_text(str(item.get("author", "")))
+            for name in ("bella", "nyelle", "jarvis")
+        )
+    ]
+    return any(looks_like_code_request(turn) for turn in user_turns[:2])
+
+
+def _continues_pending_task(message: str, recent: list[dict[str, str]]) -> bool:
+    """Resposta curta a uma pergunta da Bella, ou logo depois de um pedido de tarefa."""
+    text = normalize_text(message).strip(" ?!.,")
+    if not text or text in _GREETING_ONLY or len(text.split()) > 25:
+        return False
+    last_bella = ""
+    user_turns: list[str] = []
+    for item in reversed(recent[-8:]):
+        author = normalize_text(str(item.get("author", "")))
+        content = str(item.get("text", ""))
+        if any(name in author for name in ("bella", "nyelle", "jarvis")):
+            if not last_bella:
+                last_bella = content.strip()
+        else:
+            user_turns.append(content)
+        if len(user_turns) >= 3 and last_bella:
+            break
+    asked = last_bella.endswith("?") or "quer que eu" in normalize_text(last_bella)
+    recent_task = any(looks_like_task_request(turn) for turn in user_turns[:3])
+    return asked or recent_task
 
 
 def _social_guard_reasons(message: str, answer: str) -> tuple[str, ...]:
@@ -1110,8 +1223,8 @@ def _is_high_energy_social(message: str) -> bool:
 
 def _format_for_readability(value: str, *, complex_mode: bool) -> str:
     text = value.strip()
-    if not text:
-        return text
+    if not text or "```" in text:
+        return text  # código: quebrar linhas aqui estragaria a indentação
     text = re.sub(r"\s+(?=\d{1,3}[.)]\s+)", "\n", text)
     text = re.sub(r"\s+(?=[-•]\s+)", "\n", text)
     if "\n" in text or len(text) < 700:

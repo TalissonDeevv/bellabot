@@ -69,6 +69,23 @@ def _has_image(messages: Any) -> bool:
     return False
 
 
+def direct_fallback_enabled() -> bool:
+    """Groq direta como reserva da FreeLLMAPI. Desligada por padrão: com a
+    FreeLLMAPI ligada, toda a IA passa só por ela."""
+    raw = os.getenv("FREELLMAPI_DIRECT_FALLBACK", "false").strip().casefold()
+    return raw in {"1", "true", "yes", "on", "sim"}
+
+
+def _completion_text(payload: Any) -> str:
+    try:
+        content = payload["choices"][0]["message"].get("content")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
+    if isinstance(content, list):
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    return str(content or "")
+
+
 def _to_namespace(payload: Any) -> Any:
     if isinstance(payload, dict):
         return SimpleNamespace(**{key: _to_namespace(value) for key, value in payload.items()})
@@ -176,7 +193,12 @@ class FreeLLMAPIClient:
                 response.headers,
             )
         self.last_routed_via = response.headers.get("x-routed-via", "")
-        return _to_namespace(response.json())
+        payload = response.json()
+        if not _completion_text(payload).strip():
+            # 200 sem texto (ex.: modelo que "não viu" a imagem): conta como falha
+            # para a lista seguir para o próximo modelo.
+            raise OpenAICompatError(f"FreeLLMAPI {model}: resposta vazia", 502)
+        return _to_namespace(payload)
 
     async def _list_models(self) -> Any:
         return SimpleNamespace(data=[])
@@ -206,7 +228,7 @@ class FallbackChatClient:
                 if self.secondary is None or exc.status_code not in FALLBACK_STATUSES:
                     raise
                 LOGGER.warning("FreeLLMAPI falhou (%s); usando a Groq direta.", exc)
-                if exc.status_code in {408, 503}:
+                if exc.connection_failed:
                     # Fora do ar: não insiste em toda mensagem durante 60 s.
                     self._primary_down_until = time.monotonic() + 60
         response = await self.secondary.chat.completions.create(**kwargs)

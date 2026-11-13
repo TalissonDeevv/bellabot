@@ -16,7 +16,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from website_guard.config import Settings
 from website_guard.state import StateStore
 
-from .freellmapi_client import FallbackChatClient, FreeLLMAPIClient, freellmapi_enabled
+from .freellmapi_client import (
+    FallbackChatClient,
+    FreeLLMAPIClient,
+    direct_fallback_enabled,
+    freellmapi_enabled,
+)
 from .moderation_ai import neutralize_mass_mentions
 from .personality import BELLA_SYSTEM_PROMPT
 
@@ -320,7 +325,8 @@ class GroqService:
             if self._client is not None:
                 return self._client
             groq_client = None
-            if self._has_groq_key():
+            use_direct = not freellmapi_enabled() or direct_fallback_enabled()
+            if self._has_groq_key() and use_direct:
                 from groq import AsyncGroq
 
                 groq_client = AsyncGroq(
@@ -336,7 +342,7 @@ class GroqService:
                 LOGGER.info(
                     "IA via FreeLLMAPI em %s%s.",
                     os.getenv("FREELLMAPI_BASE_URL", ""),
-                    " com a Groq de reserva" if groq_client else " (sem reserva)",
+                    " com a Groq direta de reserva" if groq_client else " (só FreeLLMAPI)",
                 )
             else:
                 self._client = groq_client

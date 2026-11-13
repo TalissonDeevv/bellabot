@@ -78,6 +78,63 @@ class PermanentKnowledgeCenter:
             "title": knowledge["category"],
         }
 
+    async def save_owner_fact(
+        self,
+        *,
+        title: str,
+        answer: str,
+        keywords: list[str],
+        links: list[str],
+        raw: str,
+        user_id: int,
+    ) -> dict[str, Any]:
+        """Guarda um fato já estruturado pela IA ("guarde isso" do proprietário).
+
+        As palavras-chave entram como gatilhos: a busca acha a memória quando a
+        pergunta tem duas ou mais palavras dela (preço, livro, comprar...).
+        """
+        if user_id != OWNER_DISCORD_ID:
+            raise PermissionError("Somente o proprietário pode guardar memórias.")
+        title = " ".join(str(title or "").split())[:80]
+        answer = " ".join(str(answer or "").split())[:2000]
+        if not title or not answer:
+            raise ValueError("Faltou o assunto ou o que responder.")
+        triggers = list(
+            dict.fromkeys(
+                normalize_text(item).strip()
+                for item in [title, *keywords]
+                if normalize_text(item).strip()
+            )
+        )[:20]
+        record = {
+            "key": f"fato:{_safe_key(title)}",
+            "category": title,
+            "description": answer,
+            "links": list(dict.fromkeys(links))[:5],
+            "triggers": triggers,
+            "source": "owner_fact",
+            "raw": str(raw or "")[:2000],
+        }
+        await self._upsert_knowledge(record)
+        return record
+
+    async def find_owner_memories(self, query: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Memórias que combinam com a descrição ("o preço do livro")."""
+        section = await self.state.get_section(self.KNOWLEDGE_SECTION)
+        text = normalize_text(query)
+        scored = []
+        for key, value in section.items():
+            if not isinstance(value, dict) or value.get("source") == "server_summary":
+                continue
+            score = _knowledge_score(text, value)
+            category = normalize_text(str(value.get("category", "")))
+            if category and category in text:
+                score += 1.0
+            if score > 0:
+                scored.append((score, {**value, "key": key}))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [value for _, value in scored[:limit]]
+
     async def save_server_summary(
         self,
         *,
