@@ -954,16 +954,13 @@ class BellaAgent:
         content = message.content
         links = re.findall(r"https?://[^\s<>()]+", content)
         links += [f"<#{cid}>" for cid in re.findall(r"<#(\d+)>", content)]
-        title = request.name or request.memory_key
-        answer = request.text or request.memory_value
-        topic = request.topic
-        if not (title and answer):
-            # O interpretador às vezes reconhece o pedido mas não preenche os
-            # campos; uma extração dedicada e simples resolve.
-            extracted = await self._structure_memory(content)
-            title = title or extracted.get("title", "")
-            answer = answer or extracted.get("answer", "")
-            topic = topic or ", ".join(extracted.get("keywords", []))
+        # Extração dedicada sempre: o interpretador às vezes reconhece o pedido mas
+        # preenche os campos errados (ex.: título "book_price_info", sem
+        # palavras-chave), e aí ninguém acha a memória depois.
+        extracted = await self._structure_memory(content)
+        title = extracted.get("title") or request.name or request.memory_key
+        answer = extracted.get("answer") or request.text or request.memory_value
+        topic = ", ".join(extracted.get("keywords", [])) or request.topic
         keywords = [item.strip() for item in re.split(r"[,;\n]", topic or "") if item.strip()]
         try:
             record = await self.knowledge.save_owner_fact(

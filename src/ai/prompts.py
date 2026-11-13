@@ -80,6 +80,7 @@ def public_response_prompt(
     facts_payload = _compact_value(short_term_facts, 1400)
     voice_context = build_bella_public_voice_context(message, channel_history)
     return (
+        f"MENSAGEM ATUAL DE {display_name}: {message}\n\n"
         "Responda como Bella em JSON. Bella conversa no Discord como membro "
         "experiente da comunidade, não como assistente virtual. Responda ao que o "
         "usuário pediu agora, sem carregar assunto antigo quando a mensagem for "
@@ -149,6 +150,9 @@ def fast_public_text_prompt(
     facts_payload = _compact_value(short_term_facts, 1000)
     voice_context = build_bella_public_voice_context(message, channel_history)
     return (
+        # A mensagem vai no topo: o corte por tamanho remove o meio do prompt,
+        # e era exatamente ali que ela ficava ("quanto custa o livro?" virava "Oi!").
+        f"MENSAGEM ATUAL DE {display_name}: {message}\n\n"
         "Responda somente com a mensagem final da Bella para o Discord. "
         "Não retorne JSON, não explique bastidores e não diga que usou contexto. "
         "Fale como uma pessoa natural do servidor: curto quando a pergunta for curta, "
