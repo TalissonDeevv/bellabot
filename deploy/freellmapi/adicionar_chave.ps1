@@ -9,7 +9,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$Ip,
     [ValidateSet("openrouter", "mistral", "nvidia", "cohere", "huggingface", "cloudflare",
-                 "cerebras", "groq", "google", "llm7", "siliconflow", "requesty", "zhipu", "ovh")]
+                 "cerebras", "groq", "google", "llm7", "siliconflow", "requesty", "zhipu", "ovh", "kilo")]
     [string]$Plataforma,
     [switch]$Listar,
     [switch]$RedefinirSenha,
@@ -78,13 +78,22 @@ try {
     }
     if (-not $token) { throw "Login recusado." }
 
-    $chaves = @(Invoke-Api GET "/api/keys" -token $token)
+    # O PowerShell 5.1 devolve a lista JSON como um único objeto; desenrola aqui.
+    $resposta = Invoke-Api GET "/api/keys" -token $token
+    $chaves = @(foreach ($lista in @($resposta)) { foreach ($item in $lista) { $item } })
     Write-Host ""
     Write-Host "Chaves cadastradas hoje:"
-    $chaves | Group-Object platform | ForEach-Object { Write-Host ("  {0}: {1} chave(s)" -f $_.Name, $_.Count) }
+    $chaves | Where-Object { $_.platform } | Group-Object platform | ForEach-Object { Write-Host ("  {0}: {1} chave(s)" -f $_.Name, $_.Count) }
     if ($Listar) { return }
 
     Write-Host ""
+    if (@("ovh", "kilo") -contains $Plataforma) {
+        # Provedores que funcionam sem conta: a FreeLLMAPI guarda um marcador "sem chave".
+        if (@($chaves | Where-Object { $_.platform -eq $Plataforma }).Count -gt 0) { Write-Host "$Plataforma já estava ativa."; return }
+        Invoke-Api POST "/api/keys" @{ platform = $Plataforma; label = "bella" } $token | Out-Null
+        Write-Host "$Plataforma ativada sem chave."
+        return
+    }
     $chave = (Read-Secreto "Cole a chave da $Plataforma (fica escondida) e aperte Enter").Trim()
     if ($chave.Length -lt 10) { throw "Chave vazia ou curta demais." }
     Invoke-Api POST "/api/keys" @{ platform = $Plataforma; key = $chave; label = "bella" } $token | Out-Null
