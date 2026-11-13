@@ -268,8 +268,12 @@ _CODE_ONLY = re.compile(
 def looks_like_code_request(text: str) -> bool:
     """Pedido para a Bella escrever código, o que ela não faz no chat."""
     normalized = normalize_text(text)
-    if _CODE_CREATE_VERBS.search(normalized) and _CODE_BUILDABLE.search(normalized):
-        return True
+    # O objeto tem que vir logo depois do verbo: "cria um bot", "faz um site".
+    # Em "escrever um email avisando que o site atrasa", site é outro assunto.
+    for verb in _CODE_CREATE_VERBS.finditer(normalized):
+        following = " ".join(normalized[verb.end():].split()[:4])
+        if _CODE_BUILDABLE.search(following):
+            return True
     return bool(_CODE_ASK_VERBS.search(normalized) and _CODE_ONLY.search(normalized))
 
 

@@ -954,11 +954,21 @@ class BellaAgent:
         content = message.content
         links = re.findall(r"https?://[^\s<>()]+", content)
         links += [f"<#{cid}>" for cid in re.findall(r"<#(\d+)>", content)]
-        keywords = [item.strip() for item in re.split(r"[,;\n]", request.topic or "") if item.strip()]
+        title = request.name or request.memory_key
+        answer = request.text or request.memory_value
+        topic = request.topic
+        if not (title and answer):
+            # O interpretador às vezes reconhece o pedido mas não preenche os
+            # campos; uma extração dedicada e simples resolve.
+            extracted = await self._structure_memory(content)
+            title = title or extracted.get("title", "")
+            answer = answer or extracted.get("answer", "")
+            topic = topic or ", ".join(extracted.get("keywords", []))
+        keywords = [item.strip() for item in re.split(r"[,;\n]", topic or "") if item.strip()]
         try:
             record = await self.knowledge.save_owner_fact(
-                title=request.name,
-                answer=request.text,
+                title=title,
+                answer=answer,
                 keywords=keywords,
                 links=links,
                 raw=content,
@@ -972,6 +982,42 @@ class BellaAgent:
             f"quando perguntarem sobre {gatilhos or record['category']}, eu respondo: "
             f"{_short(record['description'], 300)}"
         )
+
+    async def _structure_memory(self, content: str) -> dict[str, Any]:
+        if self.ai_service is None:
+            return {}
+        try:
+            data = await self.ai_service.generate_json(
+                "O dono do servidor pediu para a assistente Bella guardar esta "
+                "informação e usar ao responder outras pessoas:\n\n"
+                f"{content}\n\n"
+                "Extraia: title = título curto do assunto (ex.: 'Livro do Talisson'); "
+                "answer = o que a Bella deve responder, como instrução clara em "
+                "terceira pessoa, mantendo exatamente valores, links e canais; "
+                "keywords = 8 a 15 palavras-chave e perguntas curtas que alguém usaria, "
+                "com sinônimos (preço, quanto custa, valor, comprar...).",
+                {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "answer": {"type": "string"},
+                        "keywords": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["title", "answer", "keywords"],
+                },
+                max_output_tokens=600,
+                timeout_seconds=20,
+                use_cache=False,
+            )
+        except Exception:
+            LOGGER.exception("Falha ao estruturar a memória.")
+            return {}
+        keywords = data.get("keywords")
+        return {
+            "title": str(data.get("title") or "").strip(),
+            "answer": str(data.get("answer") or "").strip(),
+            "keywords": [str(k) for k in keywords] if isinstance(keywords, list) else [],
+        }
 
     async def _knowledge_list(self, message, request) -> ExecutiveOutcome:
         if self.knowledge is None:
