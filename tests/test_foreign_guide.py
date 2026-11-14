@@ -56,9 +56,14 @@ def _setup(answer: str = "Hi! This channel is where people share their Discord b
     ])
     rules = FakeChannel(11, "regras", "Leia antes de postar")
     category = SimpleNamespace(name="Comunidade")
+    welcome = FakeChannel(1514971417651839197, "📌—boas-vindas", "Apresente-se aqui", [
+        ("Bella", "Seja bem-vindo! Leia as regras e se apresente."),
+    ])
+    by_id = {bots.id: bots, rules.id: rules, welcome.id: welcome}
     guild = SimpleNamespace(
-        id=1, name="Escritório do Talisson", description="Comunidade de tecnologia e negócios",
-        member_count=320, rules_channel=rules, by_category=lambda: [(category, [bots, rules])],
+        id=1467976297689911377, name="Escritório do Talisson", description="Comunidade de tecnologia e negócios",
+        member_count=320, rules_channel=rules, by_category=lambda: [(category, [bots, rules, welcome])],
+        channels=[bots, rules, welcome], get_channel=by_id.get,
     )
     author = SimpleNamespace(display_name="John", id=5, joined_at=datetime.now(timezone.utc) - timedelta(days=1))
     ai = CapturingAI(answer)
@@ -108,6 +113,24 @@ class ForeignGuideTests(unittest.IsolatedAsyncioTestCase):
         await guide.answer(message, message.content, "en")
         self.assertEqual(bots.history_calls, 1)
         self.assertEqual(general.history_calls, 0)
+
+    async def test_channel_link_is_the_asked_channel(self) -> None:
+        guide, ai, guild, bots, author = _setup()
+        text = "what is this channel https://discord.com/channels/1467976297689911377/1514971417651839197 about?"
+        await guide.answer(_message(text, guild, bots, author), text, "en")
+        prompt = ai.prompts[0]
+        self.assertIn("CANAL QUE A PESSOA PERGUNTOU:\nCanal #📌—boas-vindas", prompt)
+        self.assertIn("Seja bem-vindo", prompt)
+        self.assertEqual(bots.history_calls, 0)  # não lê o canal onde ela está
+
+    async def test_raw_mention_and_written_name(self) -> None:
+        guide, ai, guild, bots, author = _setup()
+        mention = "what is <#1514971417651839197> about?"
+        self.assertEqual([c.name for c in guide.asked_channels(_message(mention, guild, bots, author), mention)], ["📌—boas-vindas"])
+        written = "what is the boas-vindas channel for?"
+        self.assertEqual([c.name for c in guide.asked_channels(_message(written, guild, bots, author), written)], ["📌—boas-vindas"])
+        other_server = "https://discord.com/channels/999/1514971417651839197"
+        self.assertEqual(guide.asked_channels(_message(other_server, guild, bots, author), other_server), [])
 
     async def test_channel_summary_is_cached(self) -> None:
         guide, ai, guild, bots, author = _setup()

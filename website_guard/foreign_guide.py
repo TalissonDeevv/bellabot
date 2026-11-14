@@ -21,6 +21,8 @@ from unicodedata import combining, normalize
 
 import discord
 
+from .discord_entities import CHANNEL_LINK_RE
+
 LOGGER = logging.getLogger(__name__)
 
 # Palavras bem típicas de cada idioma (sem acento, minúsculas). Palavras que
@@ -207,18 +209,58 @@ class ForeignGuide:
         return digest
 
     # ------------------------------------------------------------ resposta
+    @staticmethod
+    def _lookup(guild: Any, channel_id: int) -> Any:
+        getter = getattr(guild, "get_channel_or_thread", None) or getattr(guild, "get_channel", None)
+        try:
+            return getter(channel_id) if callable(getter) else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def asked_channels(self, message: Any, content: str) -> list[Any]:
+        """Canais que a pessoa perguntou: menção <#id>, link do canal ou o nome escrito."""
+        guild = message.guild
+        found: dict[int, Any] = {}
+        for channel in getattr(message, "channel_mentions", []) or []:
+            found[channel.id] = channel
+        raw = f"{content} {getattr(message, 'content', '')}"
+        for match in re.finditer(r"<#(\d{15,22})>", raw):
+            channel = self._lookup(guild, int(match.group(1)))
+            if channel is not None:
+                found.setdefault(channel.id, channel)
+        for match in CHANNEL_LINK_RE.finditer(raw):
+            if int(match.group(1)) != getattr(guild, "id", None):
+                continue
+            channel = self._lookup(guild, int(match.group(2)))
+            if channel is not None:
+                found.setdefault(channel.id, channel)
+        if not found:
+            plain = _plain(raw)
+            for channel in getattr(guild, "channels", []) or []:
+                name = re.sub(r"[^a-z0-9]+", " ", _plain(getattr(channel, "name", ""))).strip()
+                if len(name) >= 4 and re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", re.sub(r"[^a-z0-9]+", " ", plain)):
+                    found.setdefault(channel.id, channel)
+        return [c for c in found.values() if hasattr(c, "history")][:2]
+
     async def answer(self, message: Any, content: str, language: str) -> str:
         guild = message.guild
         viewer = getattr(message, "author", None)
-        channels = [c for c in getattr(message, "channel_mentions", []) or [] if hasattr(c, "history")][:2]
-        if not channels and hasattr(message.channel, "history"):
-            channels = [message.channel]
+        asked = self.asked_channels(message, content)
+        channels = asked or ([message.channel] if hasattr(message.channel, "history") else [])
         digests = []
         for channel in channels:
             try:
-                digests.append(await self.channel_digest(channel))
+                digest = await self.channel_digest(channel)
             except Exception:  # noqa: BLE001
                 LOGGER.warning("Não consegui ler o histórico de %s.", getattr(channel, "id", "?"))
+                continue
+            label = "CANAL QUE A PESSOA PERGUNTOU" if asked else "CANAL ONDE A PESSOA ESTÁ (ela não citou outro)"
+            digests.append(f"{label}:\n{digest}")
+        if asked:
+            digests.append(
+                f"(Ela escreveu a pergunta em #{getattr(message.channel, 'name', '?')}, mas quer saber "
+                "do canal perguntado acima. Explique ESSE canal.)"
+            )
         overview = self.server_overview(guild, viewer)
         language_name = _LANGUAGE_NAMES.get(language, "o idioma da pessoa")
         prompt = (
@@ -226,7 +268,7 @@ class ForeignGuide:
             f"{language_name} (não português) escreveu para você e pode estar perdida.\n\n"
             f"MENSAGEM DELA ({getattr(viewer, 'display_name', 'membro')}): {content[:1500]}\n\n"
             f"SOBRE O SERVIDOR:\n{overview[:4000]}\n\n"
-            + ("\n\n".join(f"CANAL:\n{d}" for d in digests) + "\n\n" if digests else "")
+            + ("\n\n".join(digests) + "\n\n" if digests else "")
             + "Responda NO MESMO IDIOMA da mensagem dela, de forma natural e acolhedora, como uma "
             "pessoa que conhece o servidor. Se ela perguntou sobre o servidor ou um canal, explique "
             "o que é e para que serve com base no que você viu acima (resuma o assunto das conversas, "
