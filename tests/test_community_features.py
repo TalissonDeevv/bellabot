@@ -213,6 +213,21 @@ class MusicTests(Base):
         self.assertTrue(view.next.disabled)
         self.assertEqual(len(view.vote_select.options), 2)
 
+    async def test_recommending_by_replying_to_the_panel(self) -> None:
+        async def haunt(query):
+            self.assertEqual(query, "Haunt NEFFEX")
+            return {"id": "9", "title": "Haunt", "artist": "NEFFEX", "album": "Haunt", "genre": "Hip-Hop", "artwork": "", "url": "", "preview": ""}
+
+        self.features._search_song = haunt
+        channel = Channel(77)
+        sent = await self.features.post_playlist(channel)
+        reply_to_panel = SimpleNamespace(message_id=sent.id)
+        empty = await self.features.handle(self.msg("acho ela top", reference=reply_to_panel), "acho ela top", invoked=True)
+        self.assertIn("ainda tá vazia", empty.text)
+        added = await self.features.handle(self.msg("eu indico a musica Haunt - NEFFEX", reference=reply_to_panel), "eu indico a musica Haunt - NEFFEX", invoked=True)
+        self.assertIn("Haunt", added.text)
+        self.assertEqual((await self.features.ranking())[0]["title"], "Haunt")
+
     def test_song_query_cleanup(self) -> None:
         self.assertEqual(CommunityFeatures._song_query("bella, indico a música Blinding Lights do The Weeknd pra playlist"), "Blinding Lights The Weeknd")
 

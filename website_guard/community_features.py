@@ -89,6 +89,22 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _font_file(name: str, size: int) -> ImageFont.ImageFont:
+    """Fonte DejaVu específica (servidor); no Windows cai em equivalentes."""
+    fallbacks = {
+        "DejaVuSerif-Bold.ttf": ["C:/Windows/Fonts/georgiab.ttf"],
+        "DejaVuSansMono-Bold.ttf": ["C:/Windows/Fonts/consolab.ttf"],
+        "DejaVuSansMono.ttf": ["C:/Windows/Fonts/consola.ttf"],
+        "DejaVuSans.ttf": ["C:/Windows/Fonts/segoeui.ttf"],
+    }
+    for candidate in [f"/usr/share/fonts/truetype/dejavu/{name}", *fallbacks.get(name, [])]:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return _font(size, bold="Bold" in name)
+
+
 def _fit(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, width: int) -> str:
     text = str(text or "")
     if draw.textlength(text, font=font) <= width:
@@ -149,6 +165,11 @@ class CommunityFeatures:
         if reference is not None and getattr(reference, "message_id", None):
             panels = await self.state.get_section(PANELS_SECTION)
             if str(reference.message_id) in panels:
+                if MUSIC_ADD_RE.search(text) or re.search(r"\b(?:indico|indica|recomendo|sugiro|adiciona|coloca|bota)\b", text):
+                    # "indico a música X" respondendo ao painel é indicação, não opinião.
+                    reply = await self.add_song(message, content)
+                    await self._refresh_panel(message.channel, int(reference.message_id), panels[str(reference.message_id)])
+                    return Reply(reply)
                 return Reply(await self.music_feedback(message, content, panels[str(reference.message_id)]))
         if message.guild is None:
             pending = await self._pending_compliment(message.author.id)
@@ -476,43 +497,57 @@ class CommunityFeatures:
         pages = max(1, math.ceil(len(songs) / PAGE_SIZE))
         page = max(0, min(page, pages - 1))
         chunk = songs[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
-        width, row_h, top = 1100, 150, 150
-        height = top + max(1, len(chunk)) * row_h + 70
-        image = Image.new("RGB", (width, height), (14, 12, 24))
+        # Mesmo estilo do cartão de membro: grafite com granulado, capas quadradas,
+        # títulos serifados, detalhes em mono e uma cor de destaque só.
+        ink, muted, faint, line, accent = (236, 233, 226), (138, 136, 131), (92, 91, 88), (46, 46, 48), (214, 196, 160)
+        serif = lambda size: _font_file("DejaVuSerif-Bold.ttf", size)  # noqa: E731
+        mono = lambda size, bold=False: _font_file("DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf", size)  # noqa: E731
+        width, margin, row_h, top = 1000, 48, 132, 150
+        height = top + max(1, len(chunk)) * row_h + 70 if chunk else top + 190
+        image = Image.new("RGB", (width, height), (17, 17, 19))
+        image = Image.blend(image, Image.effect_noise((width, height), 14).convert("RGB"), 0.06)
         draw = ImageDraw.Draw(image)
-        for y in range(height):
-            shade = int(14 + 26 * y / height)
-            draw.line([(0, y), (width, y)], fill=(shade, 10, shade + 18))
-        title_font, big, mid, small = _font(46, bold=True), _font(30, bold=True), _font(24), _font(20)
-        draw.text((50, 40), "Playlist da semana", font=title_font, fill=(255, 255, 255))
         monday = datetime.strptime(week + "-1", "%G-W%V-%u")
-        draw.text((52, 100), f"{monday.strftime('%d/%m')} a {(monday + timedelta(days=6)).strftime('%d/%m')} • indicações do servidor",
-                  font=small, fill=(190, 170, 230))
+        draw.text((margin, 34), "PLAYLIST DA SEMANA", font=mono(14, True), fill=muted)
+        period = f"{monday.strftime('%d.%m')} — {(monday + timedelta(days=6)).strftime('%d.%m.%Y')}"
+        draw.text((width - margin - draw.textlength(period, font=mono(14, True)), 34), period, font=mono(14, True), fill=accent)
+        draw.line([(margin, 66), (width - margin, 66)], fill=line, width=1)
+        draw.text((margin, 82), "O que o servidor está ouvindo", font=serif(34), fill=ink)
         if not chunk:
-            draw.text((50, top + 40), "Ninguém indicou música esta semana ainda. Seja a primeira pessoa!", font=mid, fill=(220, 220, 220))
+            draw.text((margin, top + 10), "Ninguém indicou música ainda esta semana.", font=serif(24), fill=ink)
+            draw.text((margin, top + 56), "Responda esta mensagem com: indico a música <nome> do <cantor>", font=mono(16), fill=muted)
         artworks = await asyncio.gather(*(_download_image(s.get("artwork", "")) for s in chunk))
         for index, (song, art) in enumerate(zip(chunk, artworks)):
             y = top + index * row_h
             rank = page * PAGE_SIZE + index + 1
-            draw.rounded_rectangle((40, y + 8, width - 40, y + row_h - 8), radius=22, fill=(30, 24, 48))
-            medal = {1: (255, 205, 80), 2: (205, 210, 225), 3: (220, 150, 90)}.get(rank, (160, 140, 220))
-            draw.text((70, y + 48), f"#{rank}", font=big, fill=medal)
+            if index:
+                draw.line([(margin, y - 10), (width - margin, y - 10)], fill=line, width=1)
+            draw.text((margin, y + 30), f"{rank:02d}", font=serif(36), fill=accent if rank <= 3 else faint)
+            cover_x, cover = margin + 76, 104
             if art is not None:
-                image.paste(_rounded(art, 112, 18), (160, y + 19), _rounded(art, 112, 18))
+                image.paste(ImageOps.fit(art.convert("RGB"), (cover, cover)), (cover_x, y))
             else:
-                draw.rounded_rectangle((160, y + 19, 272, y + 131), radius=18, fill=(60, 50, 90))
-                draw.text((196, y + 55), "♪", font=big, fill=(255, 255, 255))
-            draw.text((300, y + 26), _fit(draw, song.get("title", ""), big, 560), font=big, fill=(255, 255, 255))
-            draw.text((300, y + 66), _fit(draw, song.get("artist", ""), mid, 560), font=mid, fill=(200, 185, 240))
-            draw.text((300, y + 100), _fit(draw, f"{song.get('album', '')} • {song.get('genre', '')} • indicada por {song.get('added_by_name', '?')}", small, 560),
-                      font=small, fill=(150, 140, 180))
+                draw.rectangle((cover_x, y, cover_x + cover, y + cover), fill=(34, 34, 37))
+                draw.text((cover_x + 36, y + 26), "♪", font=serif(44), fill=accent)
+            draw.rectangle((cover_x, y, cover_x + cover, y + cover), outline=line, width=1)
+            text_x = cover_x + cover + 28
+            text_w = width - margin - 170 - text_x
+            draw.text((text_x, y + 6), _fit(draw, song.get("title", ""), serif(26), text_w), font=serif(26), fill=ink)
+            draw.text((text_x, y + 44), _fit(draw, song.get("artist", ""), mono(17), text_w), font=mono(17), fill=muted)
+            details = " · ".join(part for part in (song.get("album", ""), song.get("genre", ""), f"indicada por {song.get('added_by_name', '?')}") if part)
+            draw.text((text_x, y + 74), _fit(draw, details, mono(13), text_w), font=mono(13), fill=faint)
             votes = len(song.get("votes", []))
             feedback = len(song.get("feedback", []))
-            draw.text((width - 210, y + 36), f"♥ {votes} voto{'s' if votes != 1 else ''}", font=mid, fill=(255, 140, 190))
-            draw.text((width - 210, y + 76), "1 opinião" if feedback == 1 else f"{feedback} opiniões",
-                      font=small, fill=(180, 170, 210))
-        draw.text((50, height - 50), f"página {page + 1} de {pages} • responda esta mensagem pra dar sua opinião sobre uma música",
-                  font=small, fill=(170, 160, 200))
+            right = width - margin
+            vote_text = f"♥ {votes}"
+            draw.text((right - draw.textlength(vote_text, font=serif(28)), y + 18), vote_text, font=serif(28), fill=accent if votes else muted)
+            label = "voto" if votes == 1 else "votos"
+            draw.text((right - draw.textlength(label, font=mono(12, True)), y + 56), label.upper(), font=mono(12, True), fill=faint)
+            opinions = "1 OPINIÃO" if feedback == 1 else f"{feedback} OPINIÕES"
+            draw.text((right - draw.textlength(opinions, font=mono(12, True)), y + 76), opinions, font=mono(12, True), fill=faint)
+        draw.line([(margin, height - 52), (width - margin, height - 52)], fill=line, width=1)
+        footer = f"PÁGINA {page + 1}/{pages}  ·  RESPONDA PRA INDICAR UMA MÚSICA OU DAR SUA OPINIÃO"
+        draw.text((margin, height - 36), _fit(draw, footer, mono(12, True), width - 2 * margin), font=mono(12, True), fill=faint)
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         buffer.seek(0)
@@ -565,9 +600,20 @@ class CommunityFeatures:
         await interaction.response.edit_message(attachments=[file], view=view)
         await interaction.followup.send(outcome["text"], ephemeral=True)
 
+    async def _refresh_panel(self, channel: Any, message_id: int, panel: dict[str, Any]) -> None:
+        """Atualiza o painel depois de uma indicação feita respondendo a ele."""
+        try:
+            target = await channel.fetch_message(message_id)
+            file, view, page = await self.playlist_payload(panel.get("week") or _week_key(), int(panel.get("page", 0)))
+            await target.edit(attachments=[file], view=view)
+        except Exception:  # noqa: BLE001
+            LOGGER.warning("Não consegui atualizar o painel de músicas %s.", message_id)
+
     async def music_feedback(self, message: Any, content: str, panel: dict[str, Any]) -> str:
         week = panel.get("week") or _week_key()
         songs = await self.ranking(week)
+        if not songs:
+            return "a playlist dessa semana ainda tá vazia. pra indicar, manda: \"indico a música <nome> do <cantor>\" ♡"
         text = _norm(_clean(content))
         chosen = None
         position = re.search(r"(?:#|\b(?:a|o|numero|n)\s*)(\d{1,2})\b", text)
@@ -653,58 +699,142 @@ class CommunityFeatures:
         badges = [label for ok, label in rules if ok]
         artists = sorted((profile.get("artists") or {}).items(), key=lambda kv: -kv[1])
         likes = list(profile.get("likes") or []) + [name for name, _ in artists[:3] if name not in (profile.get("likes") or [])]
+        guild = getattr(member, "guild", None)
+        ordered = sorted(
+            (m for m in getattr(guild, "members", []) or [] if not getattr(m, "bot", False) and getattr(m, "joined_at", None)),
+            key=lambda m: m.joined_at,
+        )
+        number = next((i for i, m in enumerate(ordered, start=1) if m.id == member.id), None)
         return {"messages": messages, "active_days": active_days, "days_in": days_in, "joined": joined, "xp": xp, "level": level,
-                "progress": (xp - previous_xp) / max(1, next_xp - previous_xp), "badges": badges, "likes": likes[:6]}
+                "progress": (xp - previous_xp) / max(1, next_xp - previous_xp), "missing_xp": max(0, next_xp - xp),
+                "badges": badges, "likes": likes[:6], "number": number,
+                "guild_name": getattr(guild, "name", "") or ""}
+
+    @staticmethod
+    def _accent(member: Any, avatar: Image.Image | None) -> tuple[int, int, int]:
+        """Cor do cargo da pessoa; sem cargo colorido, a cor mais marcante do avatar."""
+        role = getattr(member, "top_role", None)
+        value = int(getattr(getattr(role, "color", None), "value", 0) or 0)
+        if value:
+            return (value >> 16) & 255, (value >> 8) & 255, value & 255
+        if avatar is not None:
+            small = avatar.convert("RGB").resize((24, 24))
+            best, score = (214, 196, 160), -1.0
+            for r, g, b in small.getdata():
+                high, low = max(r, g, b), min(r, g, b)
+                saturation = (high - low) / max(1, high)
+                if 70 < high < 245 and saturation * high > score:
+                    best, score = (r, g, b), saturation * high
+            if score > 40:
+                return best
+        return 214, 196, 160  # areia: neutro e elegante no fundo escuro
 
     async def render_card(self, member: Any, stats: dict[str, Any]) -> io.BytesIO:
-        width, height = 1000, 520
-        image = Image.new("RGB", (width, height), (16, 12, 28))
-        draw = ImageDraw.Draw(image)
-        for y in range(height):
-            shade = int(16 + 30 * y / height)
-            draw.line([(0, y), (width, y)], fill=(shade + 10, 12, shade + 30))
-        draw.rounded_rectangle((24, 24, width - 24, height - 24), radius=34, outline=(150, 110, 230), width=3)
+        """Carteirinha de membro: fundo grafite com granulado, avatar quadrado, nome
+        serifado, dados em fonte mono e uma única cor de destaque."""
         avatar = None
         try:
-            avatar = Image.open(io.BytesIO(await member.display_avatar.replace(size=256).read())).convert("RGBA")
+            avatar = Image.open(io.BytesIO(await member.display_avatar.replace(size=512).read())).convert("RGB")
         except Exception:  # noqa: BLE001
             avatar = None
+        accent = self._accent(member, avatar)
+        ink, muted, faint, line = (236, 233, 226), (138, 136, 131), (92, 91, 88), (46, 46, 48)
+        serif = lambda size: _font_file("DejaVuSerif-Bold.ttf", size)  # noqa: E731
+        mono = lambda size, bold=False: _font_file("DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf", size)  # noqa: E731
+        sans = lambda size: _font_file("DejaVuSans.ttf", size)  # noqa: E731
+
+        width, margin = 1000, 48
+        # Conquistas em etiquetas: mede antes para saber a altura do cartão.
+        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        tag_font = sans(17)
+        rows, x = 1, margin
+        for badge in stats["badges"] or ["nenhuma ainda"]:
+            w = probe.textlength(badge, font=tag_font) + 26
+            if x + w > width - margin:
+                rows, x = rows + 1, margin
+            x += w + 10
+        height = 452 + rows * 40 + 44
+
+        image = Image.new("RGB", (width, height), (17, 17, 19))
+        grain = Image.effect_noise((width, height), 14).convert("RGB")
+        image = Image.blend(image, grain, 0.06)
+        draw = ImageDraw.Draw(image)
+
+        # Cabeçalho tipo documento
+        header = (stats.get("guild_name") or "membro").upper()
+        draw.text((margin, 34), _fit(draw, header, mono(14, True), 600), font=mono(14, True), fill=muted)
+        number = f"MEMBRO Nº {stats['number']:04d}" if stats.get("number") else "MEMBRO"
+        draw.text((width - margin - draw.textlength(number, font=mono(14, True)), 34), number, font=mono(14, True), fill=accent)
+        draw.line([(margin, 66), (width - margin, 66)], fill=line, width=1)
+
+        # Avatar quadrado
+        size = 196
         if avatar is not None:
-            circle = ImageOps.fit(avatar, (190, 190))
-            mask = Image.new("L", (190, 190), 0)
-            ImageDraw.Draw(mask).ellipse((0, 0, 190, 190), fill=255)
-            image.paste(circle, (60, 70), mask)
-        if avatar is None:
-            draw.ellipse((60, 70, 250, 260), fill=(70, 50, 110))
+            image.paste(ImageOps.fit(avatar, (size, size)), (margin, 92))
+        else:
+            draw.rectangle((margin, 92, margin + size, 92 + size), fill=(34, 34, 37))
             initial = (member.display_name or "?")[:1].upper()
-            letter_font = _font(90, bold=True)
-            box = draw.textbbox((0, 0), initial, font=letter_font)
-            draw.text((155 - (box[2] - box[0]) / 2 - box[0], 165 - (box[3] - box[1]) / 2 - box[1]), initial, font=letter_font, fill=(255, 255, 255))
-        draw.ellipse((55, 65, 255, 265), outline=(200, 150, 255), width=5)
-        name_font, big, mid, small = _font(44, bold=True), _font(34, bold=True), _font(24), _font(20)
-        draw.text((290, 70), _fit(draw, member.display_name, name_font, 640), font=name_font, fill=(255, 255, 255))
-        draw.text((292, 128), f"@{member.name}", font=mid, fill=(190, 170, 230))
-        draw.text((292, 175), f"Nível {stats['level']}", font=big, fill=(255, 205, 90))
-        draw.text((470, 186), f"{stats['xp']} XP", font=small, fill=(210, 200, 240))
-        draw.rounded_rectangle((292, 225, 930, 250), radius=12, fill=(50, 40, 80))
-        filled = 292 + int(638 * max(0.0, min(1.0, stats["progress"])))
-        if filled > 300:
-            draw.rounded_rectangle((292, 225, filled, 250), radius=12, fill=(190, 120, 255))
-        info = [
-            ("No servidor desde", stats["joined"].strftime("%d/%m/%Y") + f" ({stats['days_in']} dias)"),
-            ("Mensagens (120 dias)", str(stats["messages"])),
-            ("Dias ativos", str(stats["active_days"])),
+            font = serif(96)
+            box = draw.textbbox((0, 0), initial, font=font)
+            draw.text((margin + (size - (box[2] - box[0])) / 2 - box[0], 92 + (size - (box[3] - box[1])) / 2 - box[1]),
+                      initial, font=font, fill=accent)
+        draw.rectangle((margin, 92, margin + size, 92 + size), outline=line, width=1)
+        draw.rectangle((margin, 92 + size + 6, margin + 56, 92 + size + 9), fill=accent)
+
+        # Nome e usuário
+        left = margin + size + 40
+        right = width - margin
+        name_font = serif(50)
+        draw.text((left, 86), _fit(draw, member.display_name, name_font, right - left), font=name_font, fill=ink)
+        draw.text((left, 152), f"@{member.name}", font=mono(18), fill=muted)
+
+        # Nível
+        draw.text((left, 200), "NÍVEL", font=mono(13, True), fill=faint)
+        draw.text((left, 218), str(stats["level"]), font=serif(40), fill=accent)
+        level_w = draw.textlength(str(stats["level"]), font=serif(40))
+        xp_text = f"{stats['xp']:,} XP".replace(",", ".") + f"  ·  faltam {stats['missing_xp']:,} para o {stats['level'] + 1}".replace(",", ".")
+        draw.text((left + level_w + 18, 238), xp_text, font=mono(15), fill=muted)
+        bar_y = 280
+        draw.line([(left, bar_y), (right, bar_y)], fill=line, width=2)
+        filled = left + int((right - left) * max(0.0, min(1.0, stats["progress"])))
+        draw.line([(left, bar_y), (filled, bar_y)], fill=accent, width=2)
+        draw.rectangle((filled - 2, bar_y - 5, filled + 2, bar_y + 5), fill=accent)
+
+        # Dados
+        data = [
+            ("DESDE", stats["joined"].strftime("%d.%m.%Y")),
+            ("TEMPO DE CASA", f"{stats['days_in']} dias"),
+            ("MENSAGENS · 120D", f"{stats['messages']:,}".replace(",", ".")),
+            ("DIAS ATIVOS", str(stats["active_days"])),
         ]
-        for i, (label, value) in enumerate(info):
-            x = 60 + i * 300
-            draw.text((x, 300), label, font=small, fill=(170, 160, 200))
-            draw.text((x, 328), value, font=mid, fill=(255, 255, 255))
-        draw.text((60, 380), "Conquistas", font=small, fill=(170, 160, 200))
-        badges = "  •  ".join(stats["badges"]) or "ainda nenhuma: bora conversar!"
-        draw.text((60, 406), _fit(draw, badges, mid, 880), font=mid, fill=(255, 225, 150))
-        draw.text((60, 446), "Curte", font=small, fill=(170, 160, 200))
-        likes = ", ".join(stats["likes"]) or "conta pra Bella: \"meus gostos: ...\""
-        draw.text((130, 444), _fit(draw, likes, mid, 800), font=mid, fill=(200, 230, 255))
+        col = (right - left) / len(data)
+        for i, (label, value) in enumerate(data):
+            x = left + i * col
+            draw.text((x, 304), label, font=mono(12, True), fill=faint)
+            draw.text((x, 324), value, font=mono(20), fill=ink)
+
+        # Conquistas
+        y = 390
+        draw.line([(margin, y - 18), (width - margin, y - 18)], fill=line, width=1)
+        draw.text((margin, y), "CONQUISTAS", font=mono(12, True), fill=faint)
+        y += 26
+        x = margin
+        badges = stats["badges"] or ["nenhuma ainda"]
+        for badge in badges:
+            w = draw.textlength(badge, font=tag_font) + 26
+            if x + w > width - margin:
+                x, y = margin, y + 40
+            draw.rectangle((x, y, x + w, y + 30), outline=accent if stats["badges"] else line, width=1)
+            draw.text((x + 13, y + 5), badge, font=tag_font, fill=ink if stats["badges"] else muted)
+            x += w + 10
+        y += 52
+        draw.text((margin, y), "CURTE", font=mono(12, True), fill=faint)
+        likes = " · ".join(stats["likes"]) if stats["likes"] else "conte pra Bella: \"meus gostos: ...\""
+        draw.text((margin + 70, y - 3), _fit(draw, likes, sans(17), width - 2 * margin - 70), font=sans(17),
+                  fill=ink if stats["likes"] else muted)
+        stamp = f"bella · {datetime.now(timezone.utc).strftime('%d.%m.%Y')}"
+        draw.text((width - margin - draw.textlength(stamp, font=mono(12)), height - 30), stamp, font=mono(12), fill=faint)
+
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
         buffer.seek(0)
