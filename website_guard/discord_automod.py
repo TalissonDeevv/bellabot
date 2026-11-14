@@ -1200,7 +1200,7 @@ class AutoModPanelView(discord.ui.LayoutView):
         container.add_item(
             discord.ui.TextDisplay(
                 "-# A Bella configura estas regras pela API oficial do AutoMod nativo do Discord. "
-                "Recursos que não existem no AutoMod nativo não são processados por este painel."
+                "Os regex também são conferidos pela própria Bella, inclusive os que o nativo não aceita."
             )
         )
         self.add_item(container)
@@ -1359,7 +1359,7 @@ class AutoModPanelView(discord.ui.LayoutView):
         ]
         return (
             "## Central AutoMod Bella\n"
-            "Painel fixo para configurar o AutoMod nativo do Discord sem abrir a tela de configuração do servidor.\n\n"
+            "Painel fixo para configurar o AutoMod nativo do Discord e o AutoMod de regex da Bella.\n\n"
             "### Resumo operacional\n"
             f"**Estado:** {'Ativo' if config.enabled else 'Pausado'}\n"
             f"**Regras nativas criadas pela Bella:** {len(jarvis_rules)}  •  **Ativas:** {enabled}  •  **Inativas:** {disabled}\n"

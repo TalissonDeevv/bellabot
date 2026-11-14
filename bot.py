@@ -12206,7 +12206,36 @@ async def _save_automod_public_panel(
     await state.mutate_section("automod_public_panels", mutate)
 
 
+async def _discover_automod_public_panels() -> int:
+    """Acha painéis do AutoMod publicados antes de existir o registro e registra.
+
+    Procura, nos canais com "automod" no nome, a mensagem mais recente da Bella
+    que tem componentes (o painel), em servidores sem painel registrado.
+    """
+    section = await state.get_section("automod_public_panels")
+    found = 0
+    for guild in bot.guilds:
+        if section.get(str(guild.id)):
+            continue
+        for channel in guild.text_channels:
+            if "automod" not in channel.name.casefold():
+                continue
+            try:
+                async for message in channel.history(limit=30):
+                    if bot.user and message.author.id == bot.user.id and message.components:
+                        await _save_automod_public_panel(guild.id, channel.id, message.id)
+                        found += 1
+                        break
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+    return found
+
+
 async def _refresh_automod_public_panels() -> int:
+    try:
+        await _discover_automod_public_panels()
+    except Exception:
+        LOGGER.warning("Não consegui procurar painéis antigos do AutoMod.", exc_info=True)
     section = await state.get_section("automod_public_panels")
     if not isinstance(section, dict):
         return 0
