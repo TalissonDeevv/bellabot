@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -54,6 +55,10 @@ class AutoModGuildConfig:
     allowed_invites: tuple[str, ...] = ()
     allowed_phrases: tuple[str, ...] = ()
     regex_patterns: tuple[str, ...] = ()
+    # Todos os regex cadastrados. A Bella confere cada mensagem contra eles (sem o
+    # limite de 10 padrões/260 caracteres do nativo); os que o Discord aceita
+    # também vão em regex_patterns, na regra nativa.
+    bella_regex_patterns: tuple[str, ...] = ()
     mention_limit: int = 6
     mention_raid_protection: bool = True
     spam_enabled: bool = True
@@ -78,6 +83,7 @@ class AutoModGuildConfig:
             "allowed_invites": list(self.allowed_invites),
             "allowed_phrases": list(self.allowed_phrases),
             "regex_patterns": list(self.regex_patterns),
+            "bella_regex_patterns": list(self.bella_regex_patterns),
             "mention_limit": self.mention_limit,
             "mention_raid_protection": self.mention_raid_protection,
             "spam_enabled": self.spam_enabled,
@@ -105,6 +111,9 @@ class AutoModGuildConfig:
             allowed_invites=tuple(_clean_list(value.get("allowed_invites", []))),
             allowed_phrases=tuple(_clean_list(value.get("allowed_phrases", []))),
             regex_patterns=tuple(_clean_regex_patterns(value.get("regex_patterns", []))),
+            bella_regex_patterns=tuple(
+                clean_bella_patterns(value.get("bella_regex_patterns", []) or value.get("regex_patterns", []))
+            ),
             mention_limit=max(1, min(50, _safe_int(value.get("mention_limit"), 6))),
             mention_raid_protection=bool(value.get("mention_raid_protection", True)),
             spam_enabled=bool(value.get("spam_enabled", True)),
@@ -697,6 +706,161 @@ class DiscordAutoModCenter:
         await self.sync_config(guild, reason=reason)
         return config
 
+    # ------------------------------------------------------------------
+    # Regex da Bella: todos os padrões ficam aqui; os que o Discord aceita
+    # também vão para a regra nativa.
+    async def update_regex(
+        self,
+        guild: discord.Guild,
+        patterns: list[str],
+        *,
+        mode: str,
+        actor: str,
+    ) -> str:
+        config = await self.config(guild.id)
+        bella = list(config.bella_regex_patterns)
+        native = list(config.regex_patterns)
+        if mode == "remove":
+            bella = [p for p in bella if p not in patterns]
+            native = [p for p in native if p not in patterns]
+            await self.save_config(AutoModGuildConfig(**{**config.to_dict(), "bella_regex_patterns": bella, "regex_patterns": native}))
+            await self._try_sync(guild, reason=f"Regex removidos por {actor}")
+            return f"removi {len(patterns)} padrão(ões). a Bella agora confere {len(bella)}."
+        if mode == "import":
+            bella, native = [], []
+        for pattern in patterns:
+            if pattern not in bella:
+                bella.append(pattern)
+        bella = clean_bella_patterns(bella)
+        await self.save_config(AutoModGuildConfig(**{**config.to_dict(), "bella_regex_patterns": bella, "regex_patterns": native}))
+        lines: list[str] = []
+        for pattern in patterns:
+            if pattern in native:
+                lines.append(f"✅ já estava no nativo: `{pattern[:70]}`")
+                continue
+            if len(pattern) > MAX_NATIVE_REGEX_PATTERN_LENGTH:
+                lines.append(f"🤖 só a Bella (passa de {MAX_NATIVE_REGEX_PATTERN_LENGTH} caracteres): `{pattern[:70]}…`")
+                continue
+            if len(native) >= MAX_NATIVE_REGEX_PATTERNS:
+                lines.append(f"🤖 só a Bella (nativo cheio, {MAX_NATIVE_REGEX_PATTERNS}/10): `{pattern[:70]}`")
+                continue
+            current = await self.config(guild.id)
+            await self.save_config(AutoModGuildConfig(**{**current.to_dict(), "regex_patterns": native + [pattern]}))
+            error = await self._try_sync(guild, reason=f"Regex adicionado por {actor}")
+            if error:
+                current = await self.config(guild.id)
+                await self.save_config(AutoModGuildConfig(**{**current.to_dict(), "regex_patterns": native}))
+                await self._try_sync(guild, reason=f"Regex recusado pelo Discord desfeito ({actor})")
+                lines.append(f"🤖 só a Bella (o Discord recusou: {error[:90]}): `{pattern[:70]}`")
+            else:
+                native.append(pattern)
+                lines.append(f"✅ nativo + Bella: `{pattern[:70]}`")
+        return (
+            f"a Bella agora confere **{len(bella)}** regex (nativo: {len(native)}/{MAX_NATIVE_REGEX_PATTERNS}).\n"
+            + "\n".join(lines)
+        )
+
+    async def _try_sync(self, guild: discord.Guild, *, reason: str) -> str:
+        try:
+            await self.sync_config(guild, reason=reason)
+        except discord.Forbidden:
+            return "sem permissão Gerenciar Servidor"
+        except (discord.HTTPException, AutoModNativeSyncError) as exc:
+            return str(exc)
+        return ""
+
+    async def check_message(self, message: discord.Message) -> bool:
+        """A Bella confere a mensagem contra todos os regex. True se agiu."""
+        if message.guild is None or not isinstance(message.author, discord.Member) or message.author.bot:
+            return False
+        text = message.content or ""
+        if not text.strip():
+            return False
+        config = await self.config(message.guild.id)
+        if not config.enabled or not config.bella_regex_patterns:
+            return False
+        member = message.author
+        perms = member.guild_permissions
+        channel_ids = {message.channel.id, getattr(message.channel, "category_id", None), getattr(message.channel, "parent_id", None)}
+        if (
+            member.id in {OWNER_DISCORD_ID, message.guild.owner_id}
+            or perms.administrator
+            or perms.manage_messages
+            or member.id in config.exempt_user_ids
+            or set(config.exempt_role_ids) & {role.id for role in member.roles}
+            or set(config.exempt_channel_ids) & channel_ids
+        ):
+            return False
+        normalized = normalize_for_regex(text)
+        lowered = text.casefold()
+        if any(phrase.casefold() in lowered or phrase.casefold() in normalized for phrase in config.allowed_phrases):
+            return False
+        matched = await self._first_match(config.bella_regex_patterns, (text, normalized))
+        if matched is None:
+            return False
+        pattern, excerpt = matched
+        actions = []
+        try:
+            await message.delete()
+            actions.append("mensagem apagada")
+        except discord.NotFound:
+            actions.append("mensagem já tinha sumido")
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            actions.append(f"não consegui apagar ({type(exc).__name__})")
+        if config.timeout_duration_seconds > 0:
+            try:
+                await member.timeout(
+                    timedelta(seconds=config.timeout_duration_seconds),
+                    reason=f"AutoMod da Bella: regex `{pattern[:80]}`",
+                )
+                actions.append(f"timeout de {_format_duration(config.timeout_duration_seconds)}")
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                actions.append(f"não consegui aplicar timeout ({type(exc).__name__})")
+        try:
+            await message.channel.send(
+                f"{member.mention} {config.custom_message}",
+                allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
+                delete_after=12,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await self._regex_alert(message, config, pattern, excerpt, actions)
+        return True
+
+    async def _first_match(self, patterns: tuple[str, ...], texts: tuple[str, ...]) -> tuple[str, str] | None:
+        def scan() -> tuple[str, str] | None:
+            for pattern in patterns:
+                compiled = compile_bella_pattern(pattern)
+                if compiled is None:
+                    continue
+                for text in texts:
+                    found = compiled.search(text[:2000])
+                    if found:
+                        return pattern, found.group(0)
+            return None
+
+        try:
+            # Em thread com prazo: um regex mal escrito não trava a Bella.
+            return await asyncio.wait_for(asyncio.to_thread(scan), timeout=2.0)
+        except asyncio.TimeoutError:
+            return None
+
+    async def _regex_alert(self, message: discord.Message, config: AutoModGuildConfig, pattern: str, excerpt: str, actions: list[str]) -> None:
+        channel = message.guild.get_channel(config.log_channel_id or 0)
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+        embed = discord.Embed(title="🛡️ AutoMod da Bella: regex", color=discord.Color(0xE74C3C), timestamp=discord.utils.utcnow())
+        embed.add_field(name="Membro", value=f"{message.author.mention} ({message.author})\nID `{message.author.id}`", inline=True)
+        embed.add_field(name="Canal", value=message.channel.mention, inline=True)
+        embed.add_field(name="Regex", value=f"`{pattern[:1000]}`", inline=False)
+        embed.add_field(name="Trecho que casou", value=f"||{excerpt[:500]}||", inline=False)
+        embed.add_field(name="Mensagem (ocultada)", value=f"||{(message.content or '')[:900]}||", inline=False)
+        embed.add_field(name="O que eu fiz", value="\n".join(f"• {a}" for a in actions) or "-", inline=False)
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
     async def record_action(self, action: discord.AutoModAction) -> None:
         await self.increment(
             action.guild_id,
@@ -988,7 +1152,7 @@ class AutoModPanelView(discord.ui.LayoutView):
         nav2 = discord.ui.ActionRow()
         for key, label in (
             ("templates", "Templates"),
-            ("regex", "Regex Nativo"),
+            ("regex", "Regex"),
             ("stats", "Estatísticas"),
             ("badge", "Badge"),
         ):
@@ -1056,14 +1220,26 @@ class AutoModPanelView(discord.ui.LayoutView):
                 f"**Palavras cadastradas:** {len(config.blocked_words)}\n{words}"
             )
         if self.section == "regex":
-            patterns = "\n".join(f"- `{pattern}`" for pattern in config.regex_patterns[:10]) or "Nenhum padrão regex configurado."
+            native = set(config.regex_patterns)
+            items = []
+            for index, pattern in enumerate(config.bella_regex_patterns[:25], start=1):
+                shown = pattern if len(pattern) <= 90 else pattern[:87] + "…"
+                tag = "✅ nativo + Bella" if pattern in native else "🤖 só Bella"
+                items.append(f"{index}. {tag} • `{shown}`")
+            extra = len(config.bella_regex_patterns) - 25
+            listing = "\n".join(items) or "Nenhum regex cadastrado."
+            if extra > 0:
+                listing += f"\n… e mais {extra}."
             return (
-                "## AutoMod Nativo • Regex\n"
-                "Aqui a Bella configura os padrões regex dentro da regra oficial de palavras do Discord.\n"
-                "Ela aparece nas configurações do servidor e conta como uso real da API oficial de AutoMod.\n\n"
-                f"**Padrões ativos:** {len(config.regex_patterns)}/{MAX_NATIVE_REGEX_PATTERNS}\n"
-                f"{patterns}\n\n"
-                "Use uma linha por regex. O Discord aplica os padrões sem diferenciar maiúsculas/minúsculas."
+                "## AutoMod • Regex\n"
+                "Todos os regex ficam guardados aqui e **a Bella confere cada mensagem contra todos** "
+                "(sem o limite do Discord, e lendo até fontes especiais, letras de outros alfabetos e "
+                "letras separadas por espaço). Os que o Discord aceita também vão para a regra nativa, "
+                "que bloqueia antes da mensagem aparecer.\n\n"
+                f"**Regex da Bella:** {len(config.bella_regex_patterns)}  •  **No nativo:** {len(native)}/{MAX_NATIVE_REGEX_PATTERNS}\n"
+                f"{listing}\n\n"
+                "Um regex por linha (vírgula pode fazer parte do padrão). Quando um casa, a Bella apaga, "
+                "aplica o timeout da aba **Ações** e avisa no canal de logs."
             )
         if self.section == "links":
             blocked = "\n".join(f"- {item}" for item in config.blocked_domains[:20]) or "Nenhum domínio bloqueado."
@@ -1190,7 +1366,7 @@ class AutoModPanelView(discord.ui.LayoutView):
             f"**Canal de alertas:** {f'<#{config.log_channel_id}>' if config.log_channel_id else 'Não configurado'}\n"
             f"**Mensagem de bloqueio:** {(config.custom_message or DEFAULT_BLOCK_MESSAGE)[:120]}\n\n"
             "### Filtros configurados\n"
-            f"**Palavras:** {len(config.blocked_words)}  •  **Regex:** {len(config.regex_patterns)}/{MAX_NATIVE_REGEX_PATTERNS}  •  "
+            f"**Palavras:** {len(config.blocked_words)}  •  **Regex:** {len(config.bella_regex_patterns)} (nativo {len(config.regex_patterns)}/{MAX_NATIVE_REGEX_PATTERNS})  •  "
             f"**Frases permitidas:** {len(config.allowed_phrases)}\n"
             f"**Domínios bloqueados:** {len(config.blocked_domains)}  •  **Domínios liberados:** {len(config.allowed_domains)}  •  "
             f"**Convites liberados:** {len(config.allowed_invites)}\n"
@@ -1434,11 +1610,11 @@ class AutoModPanelView(discord.ui.LayoutView):
         await interaction.response.defer()
         config = await self.center.config(self.guild.id)
         await self.center.save_config(
-            AutoModGuildConfig(**{**config.to_dict(), "regex_patterns": []})
+            AutoModGuildConfig(**{**config.to_dict(), "regex_patterns": [], "bella_regex_patterns": []})
         )
         await self._sync_native(
             self.guild,
-            reason=f"Padrões regex nativos limpos por {interaction.user}",
+            reason=f"Padrões regex limpos por {interaction.user}",
         )
         await self.prepare()
         await self._edit_panel(interaction)
@@ -1651,15 +1827,15 @@ class RegexModal(AutoModModal):
     def __init__(self, panel: AutoModPanelView, *, mode: str) -> None:
         super().__init__(
             title={
-                "add": "Adicionar regex nativo",
-                "remove": "Remover regex nativo",
-                "import": "Importar regex nativo",
+                "add": "Adicionar regex",
+                "remove": "Remover regex",
+                "import": "Substituir todos os regex",
             }.get(mode, "Regex nativo")
         )
         self.panel = panel
         self.mode = mode
         self.patterns = discord.ui.TextInput(
-            label="Padrões regex oficiais do Discord",
+            label="Um regex por linha",
             style=discord.TextStyle.paragraph,
             placeholder=r"Um por linha. Ex: (?i)(discord(?:app)?\.gg(?:/|\s|$))",
             max_length=3500,
@@ -1669,49 +1845,25 @@ class RegexModal(AutoModModal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer()
-        config = await self.panel.center.config(self.panel.guild.id)
-        current = set(config.regex_patterns)
-        incoming = set(_clean_regex_patterns(str(self.patterns.value)))
+        lines = [line.strip() for line in str(self.patterns.value).splitlines() if line.strip()]
+        invalid = [line for line in lines if compile_bella_pattern(line) is None]
+        incoming = [line for line in lines if line not in invalid]
         if not incoming:
             await interaction.followup.send(
-                "Informe pelo menos um padrão regex válido.",
+                "Nenhum padrão válido. Use um regex por linha."
+                + (f"\nInválidos: " + ", ".join(f"`{i[:80]}`" for i in invalid[:5]) if invalid else ""),
                 ephemeral=True,
             )
             return
-        if self.mode == "remove":
-            current -= incoming
-        elif self.mode == "import":
-            current = incoming
-        else:
-            current |= incoming
-        new_patterns = tuple(sorted(_clean_regex_patterns(current)))
-        if len(new_patterns) > MAX_NATIVE_REGEX_PATTERNS:
-            await interaction.followup.send(
-                f"O AutoMod nativo do Discord aceita até {MAX_NATIVE_REGEX_PATTERNS} padrões regex por regra.",
-                ephemeral=True,
-            )
-            return
-        new_config = AutoModGuildConfig(
-            **{**config.to_dict(), "regex_patterns": new_patterns}
+        report = await self.panel.center.update_regex(
+            self.panel.guild,
+            incoming,
+            mode=self.mode,
+            actor=str(interaction.user),
         )
-        try:
-            await self.panel.center.save_config(new_config)
-            await self.panel._sync_native(
-                self.panel.guild,
-                reason=f"Padrões regex nativos atualizados por {interaction.user}",
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "Não consegui mexer no AutoMod nativo. A Bella precisa da permissão Gerenciar Servidor.",
-                ephemeral=True,
-            )
-            return
-        except discord.HTTPException as exc:
-            await interaction.followup.send(
-                f"O Discord recusou essa regex no AutoMod nativo: `{str(exc)[:1400]}`",
-                ephemeral=True,
-            )
-            return
+        if invalid:
+            report += "\n\n⚠️ ignorei (regex inválido): " + ", ".join(f"`{i[:80]}`" for i in invalid[:5])
+        await interaction.followup.send(report[:1900], ephemeral=True)
         await self.panel.prepare()
         await self.panel._edit_panel(interaction)
 
@@ -2243,19 +2395,93 @@ def _clean_list(values: Any) -> list[str]:
 
 
 def _clean_regex_patterns(values: Any) -> list[str]:
+    """Padrões para o AutoMod nativo: um por linha (regex usa vírgula por dentro,
+    como em {0,4}), no máximo 10 e 260 caracteres. Os maiores ficam só com a Bella."""
     if isinstance(values, str):
-        iterable = values.replace(",", "\n").splitlines()
+        iterable = values.splitlines()
     else:
         iterable = values if isinstance(values, (list, tuple, set)) else []
     result: list[str] = []
     for item in iterable:
         cleaned = str(item).strip()
-        if not cleaned:
+        if not cleaned or len(cleaned) > MAX_NATIVE_REGEX_PATTERN_LENGTH:
             continue
-        cleaned = cleaned[:MAX_NATIVE_REGEX_PATTERN_LENGTH]
         if cleaned not in result:
             result.append(cleaned)
         if len(result) >= MAX_NATIVE_REGEX_PATTERNS:
+            break
+    return result
+
+
+_REGEX_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x", "к": "k", "м": "m", "т": "t", "н": "h",
+    "в": "b", "і": "i", "ј": "j", "ѕ": "s", "ԁ": "d", "υ": "u", "ν": "v", "ο": "o", "α": "a", "ε": "e", "ρ": "p",
+    "τ": "t", "κ": "k", "ι": "i", "ᴀ": "a", "ʙ": "b", "ᴄ": "c", "ᴅ": "d", "ᴇ": "e", "ғ": "f", "ɢ": "g", "ʜ": "h",
+    "ɪ": "i", "ᴊ": "j", "ᴋ": "k", "ʟ": "l", "ᴍ": "m", "ɴ": "n", "ᴏ": "o", "ᴘ": "p", "ʀ": "r", "ꜱ": "s", "ᴛ": "t",
+    "ᴜ": "u", "ᴠ": "v", "ᴡ": "w", "ʏ": "y", "ᴢ": "z",
+})
+
+
+def normalize_for_regex(text: str) -> str:
+    """Desfaz disfarces antes de conferir os regex: fontes especiais (𝓬𝓪𝓬𝓱𝓸𝓻𝓻𝓸, ｃａｃｈｏｒｒｏ),
+    letras de emoji/bandeira, letras de outros alfabetos, caracteres invisíveis e letras
+    soltas separadas por espaço ou ponto (c a c h o r r o, c.a.c.h.o.r.r.o)."""
+    out = []
+    for char in str(text or ""):
+        code = ord(char)
+        if 0x1F1E6 <= code <= 0x1F1FF:
+            out.append(chr(ord("a") + code - 0x1F1E6))
+        elif 0x1F170 <= code <= 0x1F189:
+            out.append(chr(ord("a") + code - 0x1F170))
+        elif 0x1F150 <= code <= 0x1F169:
+            out.append(chr(ord("a") + code - 0x1F150))
+        elif char in "​‌‍⁠﻿­️":
+            continue
+        else:
+            out.append(char)
+    value = unicodedata.normalize("NFKC", "".join(out)).casefold().translate(_REGEX_CONFUSABLES)
+    # letras soltas: "c a c h o r r o" -> "cachorro" (só junta sequências de 3+ letras isoladas)
+    return re.sub(
+        r"(?<!\w)(?:\w[\s._\-*]){2,}\w(?!\w)",
+        lambda m: re.sub(r"[\s._\-*]", "", m.group(0)),
+        value,
+    )
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400} dia(s)"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} h"
+    return f"{max(1, seconds // 60)} min"
+
+
+MAX_BELLA_REGEX_PATTERNS = 200
+MAX_BELLA_REGEX_LENGTH = 2000
+
+
+def compile_bella_pattern(pattern: str) -> "re.Pattern[str] | None":
+    """Compila no motor do Python, sem diferenciar maiúsculas (como o Discord)."""
+    try:
+        return re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def clean_bella_patterns(values: Any) -> list[str]:
+    if isinstance(values, str):
+        iterable = values.splitlines()
+    else:
+        iterable = values if isinstance(values, (list, tuple, set)) else []
+    result: list[str] = []
+    for item in iterable:
+        cleaned = str(item).strip()
+        if not cleaned or len(cleaned) > MAX_BELLA_REGEX_LENGTH or cleaned in result:
+            continue
+        if compile_bella_pattern(cleaned) is None:
+            continue
+        result.append(cleaned)
+        if len(result) >= MAX_BELLA_REGEX_PATTERNS:
             break
     return result
 

@@ -1705,6 +1705,12 @@ async def _handle_message(message: discord.Message) -> None:
         )
     if await spam_trap.handle_message(message):
         return
+    try:
+        # AutoMod da Bella: todos os regex do painel (inclusive os que o nativo não aceita).
+        if await discord_automod_center.check_message(message):
+            return
+    except Exception:
+        LOGGER.exception("Falha no AutoMod de regex da Bella para a mensagem %s", message.id)
     if await autonomous_moderation.handle_message(message):
         return
     if (
