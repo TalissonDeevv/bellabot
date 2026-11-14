@@ -124,7 +124,9 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(local_score(text)[0], 3, text)
 
     def test_innocent_text_is_not_glued(self) -> None:
-        for text in ("fofo de ramos", "ele explica muito bem", "a computaria fica pronta amanhã",
+        for text in ("<@933780111742877777> os ngc tipo da api, te passo aqui msm ou no pv?",
+                     "me add no telegram @talisson_dev pra gente fechar o projeto",
+                     "kkkk 😈🔥 bora jogar hoje?", "fofo de ramos", "ele explica muito bem", "a computaria fica pronta amanhã",
                      "o # do canal é #geral e o @ é @talisson", "tenho 100% de certeza & pronto"):
             self.assertLess(local_score(text)[0], 3, text)
 
@@ -186,7 +188,7 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("fora")
 
         self.guard.ai = Down()
-        await self.guard.handle_message(self._message("vendo pack, me chama no zap 🔥🍆"))
+        await self.guard.handle_message(self._message("vendo packs de nudes, me chama no zap 🍆"))
         self.assertEqual(self.order[0], "apagou")
         self.member.timeout.assert_not_awaited()
         self.assertIn("IA estava indisponível", {f.name: f.value for f in self.log_channel.sent[0]["embed"].fields}["O que eu fiz"])
@@ -195,6 +197,67 @@ class GuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.guard.handle_message(self._message(LISA, author=_member(admin=True))))
         self.assertFalse(await self.guard.handle_message(self._message("bom dia pessoal, alguém sabe deploy na contabo?")))
         self.assertEqual(self.order, [])
+
+    async def test_sexual_image_is_punished_and_normal_image_is_kept(self) -> None:
+        import io as _io
+        from PIL import Image
+
+        buffer = _io.BytesIO()
+        Image.new("RGB", (40, 40), (200, 100, 100)).save(buffer, "PNG")
+        png = buffer.getvalue()
+
+        async def read():
+            return png
+
+        attachment = SimpleNamespace(filename="foto.png", content_type="image/png", size=len(png), read=read)
+        seen = {}
+
+        class VisionAI(AI):
+            def __init__(self, violation):
+                super().__init__(violation)
+
+            async def generate_json(self, prompt, schema, **kwargs):
+                seen["media"] = kwargs.get("media")
+                return await super().generate_json(prompt, schema, **kwargs)
+
+        self.guard.ai = VisionAI(violation=False)
+        message = self._message("olha minha foto")
+        message.attachments = [attachment]
+        self.assertFalse(await self.guard.handle_message(message))
+        self.assertEqual(seen["media"][0].mime_type, "image/png")
+        self.assertNotIn("apagou", self.order)  # imagem normal não é apagada
+
+        self.guard.ai = VisionAI(violation=True)
+        message = self._message("")
+        message.attachments = [attachment]
+        self.assertTrue(await self.guard.handle_message(message))
+        self.assertIn("apagou", self.order)
+        self.member.timeout.assert_awaited_once()
+        log = self.log_channel.sent[-1]
+        self.assertTrue(log["files"][0].filename.startswith("SPOILER_"))
+        case = next(iter((await self.state.get_section(CASES_SECTION)).values()))
+        self.assertIn("[imagem: foto.png]", case["content"])
+
+    async def test_owner_sets_exempt_roles(self) -> None:
+        partner = SimpleNamespace(id=555000000000000555, name="Parceiros")
+        self.guild.get_role = lambda rid: partner if rid == partner.id else None
+        self.guild.roles = [partner]
+        owner = SimpleNamespace(id=OWNER, guild_permissions=SimpleNamespace(administrator=True))
+        command = SimpleNamespace(author=owner, guild=self.guild, role_mentions=[partner])
+        answer = await self.guard.handle_config(command, "bella, libera o cargo @Parceiros do filtro de conteúdo sexual")
+        self.assertIn("Parceiros", answer)
+        self.member.roles = [partner]
+        self.assertFalse(await self.guard.handle_message(self._message(LISA)))
+        listing = await self.guard.handle_config(SimpleNamespace(author=owner, guild=self.guild, role_mentions=[]), "quais cargos estão liberados do filtro?")
+        self.assertIn(f"<@&{partner.id}>", listing)
+        removed = await self.guard.handle_config(command, "bella, tira o cargo @Parceiros da exceção do filtro")
+        self.assertIn("voltam a passar", removed)
+        # Persistiu: um guard novo (reinício) lê do banco.
+        fresh = SexualContentGuard(self.bot, self.state, ai_service=self.ai, owner_id=OWNER, log_channel_id=LOG_CHANNEL)
+        await fresh._load_config()
+        self.assertNotIn(partner.id, fresh.custom_exempt_role_ids)
+        stranger = SimpleNamespace(id=9, guild_permissions=SimpleNamespace(administrator=False))
+        self.assertIsNone(await self.guard.handle_config(SimpleNamespace(author=stranger, guild=self.guild, role_mentions=[partner]), "libera o cargo @Parceiros do filtro"))
 
     async def test_owner_decides_ban(self) -> None:
         await self.guard.handle_message(self._message(LISA))

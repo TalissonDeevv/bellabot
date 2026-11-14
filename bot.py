@@ -1745,6 +1745,15 @@ async def _handle_message(message: discord.Message) -> None:
             await maintenance_center.reply_to_message(message)
         if ai_allowed_here:
             return
+    if invoked and message.guild is not None:
+        try:
+            guard_config_reply = await sexual_guard.handle_config(message, clean_content or content)
+        except Exception:
+            LOGGER.exception("Falha ao configurar cargos do filtro de conteúdo sexual.")
+            guard_config_reply = None
+        if guard_config_reply:
+            await _reply_public(message, guard_config_reply)
+            return
     if invoked and message.author.id == owner_assistant.owner_id:
         try:
             owner_reply = await owner_assistant.handle(message, clean_content or content)

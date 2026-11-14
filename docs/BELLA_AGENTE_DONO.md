@@ -176,3 +176,15 @@ ficam de fora. Se a IA falhar, responde uma mensagem curta no idioma da pessoa.
 Staff (administrador, gerenciar mensagens, moderar membros) e o dono não são analisados. Sem IA: com
 pontuação muito alta (`SEXUAL_GUARD_OFFLINE_THRESHOLD`, 8) pune mesmo assim; abaixo disso só deixa
 apagada e manda o caso. Casos em `sexual_guard_cases`.
+
+**Só assunto de sexo:** convite pro pv/Telegram ou @ sozinhos não disparam nada; precisa de termo
+sexual, zoofilia, menores ou vários emojis sexuais junto com convite.
+
+**Imagens:** toda imagem (até 3 por mensagem; GIF usa o primeiro quadro) é analisada pela IA de visão
+(`FREELLMAPI_VISION_MODEL`). Imagem normal fica; imagem sexual é apagada e segue o mesmo fluxo (mute,
+aviso e caso), com a imagem anexada com spoiler no card do dono.
+
+**Cargos liberados:** conversando com a Bella (dono ou administrador): "libera o cargo @Parceiros do
+filtro de conteúdo sexual", "tira o cargo VIP da exceção do filtro", "quais cargos estão liberados do
+filtro?". Fica salvo em `sexual_guard_config` (também aceita `SEXUAL_GUARD_EXEMPT_ROLE_IDS`).
+

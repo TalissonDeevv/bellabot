@@ -15,6 +15,7 @@ emojis, letras trocadas, @ de Telegram...) cai aqui:
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
@@ -28,6 +29,7 @@ import discord
 LOGGER = logging.getLogger(__name__)
 
 CASES_SECTION = "sexual_guard_cases"
+CONFIG_SECTION = "sexual_guard_config"
 DEFAULT_DECISION_LOG_CHANNEL_ID = 1551649724598063125
 LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"})
 
@@ -145,17 +147,62 @@ def local_score(text: str) -> tuple[int, list[str]]:
     if any(m in padded for m in MINORS) and (sexual or any(f" {v} " in padded for v in ZOO_VERBS)):
         score += 10
         reasons.append("possível envolvimento de menores")
-    if SOLICITATION.search(spaced):
+    emoji_hits = sum(1 for e in EMOJIS if e in (text or ""))
+    without_mentions = re.sub(r"<[@#][!&]?\d+>", " ", text or "")
+    solicitation = bool(SOLICITATION.search(spaced))
+    handle = bool(HANDLE.search(without_mentions))
+    # Só é assunto de sexo se houver sinal sexual de verdade. Convite pro pv,
+    # @ ou link sozinhos são conversa normal (ex.: "te passo no pv?").
+    sexual_signal = bool(sexual) or score > 0 or (emoji_hits >= 2 and (solicitation or handle))
+    if not sexual_signal:
+        return 0, []
+    if solicitation:
         score += 2
         reasons.append("convite para contato/divulgação")
-    if HANDLE.search(text or ""):
+    if handle:
         score += 2
         reasons.append("@/link de contato externo")
-    emoji_hits = sum(1 for e in EMOJIS if e in (text or ""))
     if emoji_hits:
         score += min(3, emoji_hits)
         reasons.append("emojis de conotação sexual")
     return score, reasons
+
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+
+
+def _is_image(attachment: Any) -> bool:
+    kind = (getattr(attachment, "content_type", "") or "").split(";")[0]
+    name = (getattr(attachment, "filename", "") or "").casefold()
+    size = int(getattr(attachment, "size", 0) or 0)
+    return (kind.startswith("image/") or name.endswith(IMAGE_EXTENSIONS)) and size <= 15 * 1024 * 1024
+
+
+def _prepare_image(data: bytes) -> tuple[bytes, str] | None:
+    """Primeiro quadro (GIF), no máximo 1024 px, em PNG: formato que todos os modelos aceitam."""
+    try:
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data))
+        image.seek(0)
+        image = image.convert("RGB")
+        image.thumbnail((1024, 1024))
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        return out.getvalue(), "image/png"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class _MessageView:
+    """A mensagem original, com o 'conteúdo' trocado pela descrição do caso."""
+
+    def __init__(self, message: Any, content: str) -> None:
+        self._message = message
+        self.content = content
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._message, name)
 
 
 class SexualContentGuard:
@@ -175,6 +222,8 @@ class SexualContentGuard:
         self.owner_id = int(owner_id)
         self.log_channel_id = int(log_channel_id or 0)
         self.exempt_role_ids = set(exempt_role_ids or ())
+        self.custom_exempt_role_ids: set[int] = set()
+        self._config_loaded = False
         self.enabled = os.getenv("SEXUAL_GUARD_ENABLED", "true").strip().casefold() not in {"0", "false", "nao", "off"}
         self.timeout_hours = float(os.getenv("SEXUAL_GUARD_TIMEOUT_HOURS", "168") or 168)  # 7 dias
         self.ai_threshold = int(os.getenv("SEXUAL_GUARD_AI_THRESHOLD", "3") or 3)
@@ -191,19 +240,83 @@ class SexualContentGuard:
         perms = getattr(member, "guild_permissions", None)
         if perms is not None and (perms.administrator or perms.manage_messages or perms.moderate_members):
             return True
-        return bool({role.id for role in getattr(member, "roles", [])} & self.exempt_role_ids)
+        allowed = self.exempt_role_ids | self.custom_exempt_role_ids
+        return bool({role.id for role in getattr(member, "roles", [])} & allowed)
+
+    # ------------------------------------------- cargos liberados (config)
+    async def _load_config(self) -> None:
+        if self._config_loaded:
+            return
+        config = (await self.state.get_section(CONFIG_SECTION)).get("exempt_role_ids", [])
+        self.custom_exempt_role_ids = {int(r) for r in config if str(r).isdigit()}
+        env_roles = os.getenv("SEXUAL_GUARD_EXEMPT_ROLE_IDS", "")
+        self.custom_exempt_role_ids |= {int(r) for r in re.findall(r"\d{15,22}", env_roles)}
+        self._config_loaded = True
+
+    async def handle_config(self, message: Any, content: str) -> str | None:
+        """Comandos do dono/admin para escolher os cargos que não passam pelo filtro."""
+        text = normalize("NFKD", (content or "").casefold())
+        text = "".join(c for c in text if not combining(c))
+        if not re.search(r"\b(?:filtro|moderacao|analise|bloqueio|conteudo sexual|guard)\b", text):
+            return None
+        member = message.author
+        perms = getattr(member, "guild_permissions", None)
+        if member.id != self.owner_id and not (perms and perms.administrator):
+            return None
+        await self._load_config()
+        guild = message.guild
+        if re.search(r"\b(?:quais|lista|listar|mostra|ver)\b.*\bcargos?\b|\bcargos? (?:liberados|isentos)\b", text) and not re.search(r"\b(?:libera|tira|remove)\b", text):
+            return self._config_text(guild)
+        adding = re.search(r"\b(?:libera|liberar|isenta|isentar|ignora|ignorar|adiciona|coloca|deixa de fora|nao (?:analisa|filtra|pune|cai))\w*", text)
+        removing = re.search(r"\b(?:tira|tirar|remove|remover|exclui|excluir|volta a analisar|cancela)\w*", text)
+        if not (adding or removing):
+            return None
+        roles = list(getattr(message, "role_mentions", []) or [])
+        if not roles and guild is not None:
+            name = re.search(r"\bcargos?\s+@?([\w\-À-ÿ ]{2,40}?)(?=\s+(?:do|da|no|na|de|pra|para|from)\b|[,.!?]|$)", content, re.IGNORECASE)
+            if name:
+                from .discord_entities import resolve_by_name
+
+                found = resolve_by_name(guild, "role", name.group(1))
+                if found.ambiguous:
+                    return "achei mais de um cargo com esse nome: " + ", ".join(c.display_name for c in found.candidates[:5]) + ". menciona o cargo (@cargo)."
+                if found.entity is not None:
+                    roles = [guild.get_role(found.entity.entity_id)]
+        roles = [r for r in roles if r is not None]
+        if not roles:
+            return "qual cargo? menciona ele (@cargo) ou fala o nome certinho."
+        ids = {r.id for r in roles}
+        if removing and not adding:
+            self.custom_exempt_role_ids -= ids
+            verb = "voltam a passar pelo filtro"
+        else:
+            self.custom_exempt_role_ids |= ids
+            verb = "não passam mais pelo filtro de conteúdo sexual"
+        await self.state.update_section(CONFIG_SECTION, "exempt_role_ids", sorted(self.custom_exempt_role_ids))
+        names = ", ".join(f"**{r.name}**" for r in roles)
+        return f"pronto: {names} {verb}.\n\n" + self._config_text(guild)
+
+    def _config_text(self, guild: Any) -> str:
+        roles = sorted(self.exempt_role_ids | self.custom_exempt_role_ids)
+        listed = [f"• <@&{r}>" for r in roles if guild is None or guild.get_role(r) is not None]
+        base = "staff com administrador, gerenciar mensagens ou moderar membros já fica de fora sempre."
+        if not listed:
+            return f"nenhum cargo extra liberado do filtro. {base}"
+        return "**cargos liberados do filtro de conteúdo sexual:**\n" + "\n".join(listed) + f"\n-# {base}"
 
     async def handle_message(self, message: Any) -> bool:
         """True se a mensagem foi tratada (apagada e punida)."""
         if not self.enabled or message.guild is None or not isinstance(message.author, discord.Member):
             return False
+        await self._load_config()
         if self._exempt(message.author):
             return False
         text = message.content or ""
-        if len(text.strip()) < 4:
-            return False
-        score, reasons = local_score(text)
+        score, reasons = local_score(text) if len(text.strip()) >= 4 else (0, [])
         if score < self.ai_threshold:
+            images = [a for a in getattr(message, "attachments", []) or [] if _is_image(a)]
+            if images:
+                return await self._check_images(message, images[:3])
             return False
         # Suspeita: some do chat ANTES da análise, para ninguém ficar vendo.
         deleted = await self._delete(message)
@@ -244,6 +357,59 @@ class SexualContentGuard:
         try:
             return await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         except (discord.Forbidden, discord.HTTPException):
+            return None
+
+    # ------------------------------------------------------------ imagens
+    async def _check_images(self, message: Any, images: list[Any]) -> bool:
+        if self.ai is None:
+            return False
+        for attachment in images:
+            try:
+                prepared = _prepare_image(await attachment.read())
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("Não consegui baixar a imagem %s.", getattr(attachment, "filename", "?"))
+                continue
+            if prepared is None:
+                continue
+            data, mime = prepared
+            verdict = await self._classify_image(data, mime, message.content or "")
+            if not verdict or not verdict.get("violation") or float(verdict.get("confidence") or 0) < 0.75:
+                continue
+            deleted = await self._delete(message)
+            view = _MessageView(message, f"[imagem: {getattr(attachment, 'filename', 'imagem')}] {message.content or ''}".strip())
+            spoiler = discord.File(io.BytesIO(data), filename=f"SPOILER_caso.{mime.split('/')[-1]}")
+            return await self._punish(view, 0, ["imagem analisada pela IA"], verdict, deleted=deleted, files=[spoiler])
+        return False
+
+    async def _classify_image(self, data: bytes, mime: str, caption: str) -> dict[str, Any] | None:
+        from src.ai.groq_service import MediaInput
+
+        try:
+            return await self.ai.generate_json(
+                "Você modera um servidor do Discord de tecnologia e negócios (público geral, pode ter menores). "
+                f"Analise a imagem enviada por um membro. Legenda: {caption[:500] or '(sem legenda)'}\n\n"
+                "violation: true SOMENTE se a imagem tiver conteúdo SEXUAL: nudez, genitália, ato sexual, "
+                "pornografia, insinuação sexual explícita, divulgação de conteúdo +18/packs, texto sexual escrito "
+                "na imagem, ou qualquer conteúdo sexual com menores ou animais. false para todo o resto: memes, "
+                "prints de tela, código, roupas de praia normais, beijo, arte sem nudez, violência ou xingamento "
+                "sem tema sexual. category: sexual_explicito, divulgacao_mais18, zoofilia, menores, nenhum. "
+                "theme: o que a imagem mostra em poucas palavras, sem detalhes gráficos. refers_to: a que se "
+                "refere. severity: 1 a 5. confidence: 0 a 1. Português.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "violation": {"type": "boolean"}, "category": {"type": "string"}, "theme": {"type": "string"},
+                        "refers_to": {"type": "string"}, "severity": {"type": "integer"}, "confidence": {"type": "number"},
+                    },
+                    "required": ["violation", "category", "theme", "confidence"],
+                },
+                media=[MediaInput(data=data, mime_type=mime)],
+                max_output_tokens=500,
+                timeout_seconds=30,
+                use_cache=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("IA indisponível para analisar imagem: %s", type(exc).__name__)
             return None
 
     async def _delete(self, message: Any) -> str:
@@ -311,7 +477,8 @@ class SexualContentGuard:
             LOGGER.warning("IA indisponível para classificar conteúdo sexual: %s", type(exc).__name__)
             return None
 
-    async def _punish(self, message: Any, score: int, reasons: list[str], verdict: dict[str, Any], *, deleted: str, live: Any = None) -> bool:
+    async def _punish(self, message: Any, score: int, reasons: list[str], verdict: dict[str, Any], *, deleted: str,
+                      live: Any = None, files: list[Any] | None = None) -> bool:
         member = message.author
         actions: list[str] = [deleted]
         hours = min(self.timeout_hours, 24 * 28)
@@ -330,7 +497,7 @@ class SexualContentGuard:
             "actions": actions, "status": "aguardando decisão", "at": datetime.now(timezone.utc).isoformat(),
         })
         await self._warn_publicly(message, verdict)
-        await self._log(message, score, reasons, verdict, actions=actions, case_id=case_id, existing=live)
+        await self._log(message, score, reasons, verdict, actions=actions, case_id=case_id, existing=live, files=files)
         return True
 
     def _general_channel(self, guild: Any, fallback: Any) -> Any:
@@ -377,7 +544,8 @@ class SexualContentGuard:
             LOGGER.warning("Não consegui avisar no chat geral sobre %s.", member.id)
 
     async def _log(self, message: Any, score: int, reasons: list[str], verdict: dict[str, Any] | None,
-                   *, actions: list[str], case_id: str | None, existing: Any = None, cleared: bool = False) -> None:
+                   *, actions: list[str], case_id: str | None, existing: Any = None, cleared: bool = False,
+                   files: list[Any] | None = None) -> None:
         channel = self.bot.get_channel(self.log_channel_id) if self.log_channel_id else None
         if channel is None and existing is None:
             return
@@ -429,7 +597,7 @@ class SexualContentGuard:
                     )
             else:
                 await channel.send(
-                    content=ping, embed=embed, view=view,
+                    content=ping, embed=embed, view=view, files=files or [],
                     allowed_mentions=discord.AllowedMentions(users=[discord.Object(self.owner_id)], roles=False, everyone=False),
                 )
         except (discord.Forbidden, discord.HTTPException):
