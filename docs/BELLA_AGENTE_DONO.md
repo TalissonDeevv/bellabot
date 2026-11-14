@@ -153,3 +153,26 @@ ficam de fora. Se a IA falhar, responde uma mensagem curta no idioma da pessoa.
 - **Cartão de membro**: "meu perfil" gera a imagem (nível/XP, tempo no servidor, mensagens, dias
   ativos, conquistas e gostos) e posta em `MEMBER_CARD_CHANNEL_ID` (padrão 1467981828559212544).
   "meus gostos: python, anime" guarda os gostos; artistas indicados também entram.
+
+## Bloqueio de conteúdo sexual
+
+`website_guard/sexual_content_guard.py`. Age só no que escapa do AutoMod nativo do Discord
+(o AutoMod barra antes de a mensagem existir):
+
+1. Filtro local gratuito desfaz disfarces: fontes especiais (𝓯𝓾𝓭𝓮𝓻, ｆｕｄｅｒ, ⓕⓤⓓⓔⓡ), letras de emoji
+   e de bandeira, letras de outros alfabetos, símbolos e números no lugar de letras (@ $ & % # | 3 4 0),
+   pontos/espaços/emojis/caracteres invisíveis entre as letras. Pontua termos sexuais, zoofilia,
+   menores, convite para Telegram/WhatsApp/pv, @ de perfis externos e emojis de conotação sexual.
+2. Suspeita (`SEXUAL_GUARD_AI_THRESHOLD`, 3 pontos): **apaga na hora** e posta o card "Analisando…"
+   no canal privado do dono (1570783779574780176).
+3. A IA lê a mensagem (original e sem disfarce) e diz categoria, tema, a que se refere, gravidade e
+   confiança. Falso alarme: devolve o texto ao canal e o card fica verde.
+4. Confirmado: mute de `SEXUAL_GUARD_TIMEOUT_HOURS` (168 h), aviso escrito pela IA no chat geral
+   mencionando a pessoa (sem repetir o conteúdo; canal `GENERAL_CHAT_CHANNEL_ID` ou o que tiver
+   "bate-papo"/"geral" no nome) e o card vira o caso com botões **Banir / Tirar o mute / Manter o mute**
+   (funcionam depois de reiniciar).
+5. A decisão é registrada em `SEXUAL_GUARD_DECISION_LOG_CHANNEL_ID` (padrão 1551649724598063125).
+
+Staff (administrador, gerenciar mensagens, moderar membros) e o dono não são analisados. Sem IA: com
+pontuação muito alta (`SEXUAL_GUARD_OFFLINE_THRESHOLD`, 8) pune mesmo assim; abaixo disso só deixa
+apagada e manda o caso. Casos em `sexual_guard_cases`.
