@@ -44,7 +44,6 @@ from website_guard.bella_agent import BellaAgent
 from website_guard.discord_entities import allowed_mention_ids, sanitize_model_mentions
 from website_guard.community_features import CommunityFeatures, MusicPanelView
 from website_guard.foreign_guide import ForeignGuide
-from website_guard.sexual_content_guard import GuardCaseButton, SexualContentGuard
 from website_guard.owner_assistant import OwnerAssistant
 from website_guard.reminder_service import ReminderService, looks_like_reminder_request
 from website_guard.automation import (
@@ -535,16 +534,6 @@ bella_agent.decision_checker = owner_assistant.check_decisions
 foreign_guide = ForeignGuide(ai_service)
 # Elogio anônimo, revisão de ideia, playlist da semana e cartão de membro.
 community = CommunityFeatures(bot, state, ai_service=ai_service)
-# Conteúdo sexual que escapa do AutoMod: apaga, a IA analisa, muta, avisa e manda o caso pro Talisson.
-sexual_guard = SexualContentGuard(
-    bot,
-    state,
-    ai_service=ai_service,
-    owner_id=settings.talisson_user_id,
-    log_channel_id=owner_assistant.channel_id,
-    exempt_role_ids=set(settings.admin_role_ids or ()),
-)
-GuardCaseButton.guard = sexual_guard
 automation_center = KnowledgeAutomationCenter(state, ai_service)
 english_learning = EnglishLearningManager(state, ai_service)
 
@@ -924,7 +913,6 @@ async def on_ready() -> None:
         ticket_admin_panel_view_registered = True
     if not getattr(community, "view_registered", False):
         bot.add_view(MusicPanelView(community))
-        bot.add_dynamic_items(GuardCaseButton)
         community.view_registered = True
     if not english_admin_panel_view_registered:
         bot.add_view(EnglishAdminPanelView())
@@ -1717,11 +1705,6 @@ async def _handle_message(message: discord.Message) -> None:
         )
     if await spam_trap.handle_message(message):
         return
-    try:
-        if await sexual_guard.handle_message(message):
-            return
-    except Exception:
-        LOGGER.exception("Falha no filtro de conteúdo sexual para a mensagem %s", message.id)
     if await autonomous_moderation.handle_message(message):
         return
     if (
@@ -1744,15 +1727,6 @@ async def _handle_message(message: discord.Message) -> None:
         if invoked and ai_allowed_here:
             await maintenance_center.reply_to_message(message)
         if ai_allowed_here:
-            return
-    if invoked and message.guild is not None:
-        try:
-            guard_config_reply = await sexual_guard.handle_config(message, clean_content or content)
-        except Exception:
-            LOGGER.exception("Falha ao configurar cargos do filtro de conteúdo sexual.")
-            guard_config_reply = None
-        if guard_config_reply:
-            await _reply_public(message, guard_config_reply)
             return
     if invoked and message.author.id == owner_assistant.owner_id:
         try:
