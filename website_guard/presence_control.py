@@ -42,7 +42,7 @@ ACTIVITY_LABELS = {
 }
 EXTERNAL_MODE_LABELS = {
     "neffex": "NEFFEX aleatório",
-    "squarecloud": "Hospedagem SquareCloud",
+    "squarecloud": "Hospedagem Contabo",
     "dynamic": "Rotação dinâmica",
     "streamer": "Modo streamer",
     "default": "Presença padrão",

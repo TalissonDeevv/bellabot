@@ -202,7 +202,7 @@ def build_public_statuses(
         else 0
     )
     hosting_latency = f"{hosting_latency_ms if hosting_latency_ms is not None else site_latency}ms"
-    squarecloud_status = f"squarecloud.app [{hosting_latency}]"
+    squarecloud_status = f"contabo.com [{hosting_latency}]"
     if active_keys and all(key == "squarecloud" for key in active_keys):
         return [squarecloud_status[:100]]
 

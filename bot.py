@@ -220,6 +220,7 @@ from website_guard.status_panel import (
     build_public_statuses,
     make_activity,
     make_streaming_activity,
+    normalize_status_keys,
     parse_status_keys,
     status_config_embed,
 )
@@ -2505,10 +2506,23 @@ async def _current_squarecloud_latency_ms(*, live: bool = False) -> int | None:
         return None
 
 
+def _host_latency_ms() -> int | None:
+    """Latência real da Bella (servidor Contabo) até o Discord."""
+    try:
+        value = float(bot.latency)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")) or value <= 0:
+        return None
+    return int(value * 1000)
+
+
 async def _squarecloud_presence_text(*, live: bool = False) -> str:
-    latency_ms = await _current_squarecloud_latency_ms(live=live)
-    latency = latency_ms if latency_ms is not None else 0
-    return f"squarecloud.app [{latency}ms]"
+    # O modo continua chamado "squarecloud" por compatibilidade, mas a Bella
+    # agora roda na Contabo: mostra a latência real do servidor até o Discord.
+    del live
+    latency = _host_latency_ms()
+    return f"contabo.com [{latency if latency is not None else 0}ms]"
 
 
 async def _hosting_manual_stop_active() -> bool:
@@ -3243,13 +3257,10 @@ def _looks_like_hosting_latency_question(content: str) -> bool:
 
 
 async def _hosting_latency_public_reply() -> str:
-    latency_ms = await _current_squarecloud_latency_ms(live=True)
+    latency_ms = _host_latency_ms()
     if latency_ms is None:
-        return (
-            "Ainda não consegui medir a latência da Square Cloud agora. "
-            "Assim que o monitor conseguir consultar a hospedagem, eu te passo certinho."
-        )
-    return f"Minha latência na hospedagem agora tá em **{latency_ms}ms**."
+        return "Ainda tô terminando de conectar, então não consegui medir a latência agora. Tenta de novo em instantes?"
+    return f"Tô hospedada na Contabo e minha latência até o Discord agora tá em **{latency_ms}ms**."
 
 
 def _looks_like_mass_mention_social_engineering(content: str) -> bool:
@@ -4378,15 +4389,8 @@ async def update_dynamic_statuses() -> None:
         if isinstance(hosting_latest, dict)
         else ""
     )
-    try:
-        hosting_latency_ms = (
-            int(hosting_latest["latency"])
-            if isinstance(hosting_latest, dict)
-            and hosting_latest.get("latency") is not None
-            else None
-        )
-    except (TypeError, ValueError):
-        hosting_latency_ms = None
+    # Hospedagem na Contabo: a latência é a do próprio servidor até o Discord.
+    hosting_latency_ms = _host_latency_ms()
     now = time.time()
     presence_owner = await state.get("presence_owner_guild_id")
     presence_updated = False
@@ -4431,8 +4435,9 @@ async def update_dynamic_statuses() -> None:
                 or int(presence_owner) == config.guild_id
             )
         ):
+            hosting_only = set(normalize_status_keys(config.active_status_keys)) == {"squarecloud"}
             await bot.change_presence(
-                status=discord.Status.dnd,
+                status=discord.Status.idle if hosting_only else discord.Status.dnd,
                 activity=make_activity(config.presence_type, current),
             )
             presence_updated = True
@@ -15691,7 +15696,7 @@ async def _presence_panel_external_details(config: dict[str, Any]) -> dict[str, 
     if mode == "squarecloud":
         return {
             "current": (
-                "🔴 **Não perturbe**  •  **Hospedagem SquareCloud**\n"
+                "🌙 **Ausente**  •  **Hospedagem Contabo**\n"
                 f"{await _squarecloud_presence_text(live=False)}"
             )
         }
@@ -15805,7 +15810,7 @@ async def _presence_panel_external_action(
             await state.set("presence_owner_guild_id", interaction.guild.id)
             text = await _squarecloud_presence_text(live=True)
             await bot.change_presence(
-                status=discord.Status.dnd,
+                status=discord.Status.idle,
                 activity=make_activity(status_config.presence_type, text),
             )
             result = f"Modo Hospedagem ativado com `{text}`."
@@ -16060,7 +16065,7 @@ async def slash_presence_start(interaction: discord.Interaction) -> None:
 
 @presence_group.command(
     name="squarecloud",
-    description="Deixa a presença mostrando a latência da hospedagem Square Cloud.",
+    description="Deixa a presença mostrando a latência da hospedagem (Contabo).",
 )
 async def slash_presence_squarecloud(
     interaction: discord.Interaction,
@@ -16094,7 +16099,7 @@ async def slash_presence_squarecloud(
     await state.set("presence_owner_guild_id", interaction.guild.id)
     text = await _squarecloud_presence_text(live=True)
     await bot.change_presence(
-        status=discord.Status.dnd,
+        status=discord.Status.idle,
         activity=make_activity(config.presence_type, text),
     )
     await interaction.followup.send(
