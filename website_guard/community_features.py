@@ -730,110 +730,130 @@ class CommunityFeatures:
         return 214, 196, 160  # areia: neutro e elegante no fundo escuro
 
     async def render_card(self, member: Any, stats: dict[str, Any]) -> io.BytesIO:
-        """Carteirinha de membro: fundo grafite com granulado, avatar quadrado, nome
-        serifado, dados em fonte mono e uma única cor de destaque."""
+        """Carteira de membro com o visual do RG brasileiro (carteira de identidade):
+        papel esverdeado com linhas de segurança onduladas, foto 3x4, campos com
+        rótulos em verde, assinatura e a faixa de leitura no rodapé. Sem símbolos
+        oficiais (brasão, "República Federativa", CPF): o emissor é o servidor."""
         avatar = None
         try:
             avatar = Image.open(io.BytesIO(await member.display_avatar.replace(size=512).read())).convert("RGB")
         except Exception:  # noqa: BLE001
             avatar = None
-        accent = self._accent(member, avatar)
-        ink, muted, faint, line = (236, 233, 226), (138, 136, 131), (92, 91, 88), (46, 46, 48)
+        green, label_c, ink, soft = (22, 92, 62), (46, 118, 84), (24, 30, 28), (90, 110, 100)
         serif = lambda size: _font_file("DejaVuSerif-Bold.ttf", size)  # noqa: E731
+        serif_r = lambda size: _font_file("DejaVuSerif.ttf", size)  # noqa: E731
+        sans = lambda size, bold=False: _font_file("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf", size)  # noqa: E731
         mono = lambda size, bold=False: _font_file("DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf", size)  # noqa: E731
-        sans = lambda size: _font_file("DejaVuSans.ttf", size)  # noqa: E731
 
-        width, margin = 1000, 48
-        # Conquistas em etiquetas: mede antes para saber a altura do cartão.
-        probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-        tag_font = sans(17)
-        rows, x = 1, margin
-        for badge in stats["badges"] or ["nenhuma ainda"]:
-            w = probe.textlength(badge, font=tag_font) + 26
-            if x + w > width - margin:
-                rows, x = rows + 1, margin
-            x += w + 10
-        height = 452 + rows * 40 + 44
-
-        image = Image.new("RGB", (width, height), (17, 17, 19))
-        grain = Image.effect_noise((width, height), 14).convert("RGB")
-        image = Image.blend(image, grain, 0.06)
+        width, height = 1000, 632
+        image = Image.new("RGB", (width, height), (226, 238, 224))
+        draw = ImageDraw.Draw(image)
+        # Fundo: degradê verde-claro -> azul-claro, como o papel do documento
+        for x in range(width):
+            t = x / width
+            draw.line([(x, 0), (x, height)], fill=(int(224 - 8 * t), int(238 + 2 * t), int(222 + 18 * t)))
+        # Linhas de segurança onduladas (guilhoché)
+        for k in range(0, height + 60, 9):
+            points = [(x, k + 7 * math.sin(x / 38 + k / 25) + 4 * math.sin(x / 13)) for x in range(0, width + 10, 10)]
+            draw.line(points, fill=(204, 224, 206), width=1)
+        for k in range(-40, width, 46):
+            points = [(k + 10 * math.sin(y / 30 + k), y) for y in range(0, height + 10, 10)]
+            draw.line(points, fill=(212, 228, 214), width=1)
+        image = Image.blend(image, Image.effect_noise((width, height), 10).convert("RGB"), 0.03)
         draw = ImageDraw.Draw(image)
 
-        # Cabeçalho tipo documento
-        header = (stats.get("guild_name") or "membro").upper()
-        draw.text((margin, 34), _fit(draw, header, mono(14, True), 600), font=mono(14, True), fill=muted)
-        number = f"MEMBRO Nº {stats['number']:04d}" if stats.get("number") else "MEMBRO"
-        draw.text((width - margin - draw.textlength(number, font=mono(14, True)), 34), number, font=mono(14, True), fill=accent)
-        draw.line([(margin, 66), (width - margin, 66)], fill=line, width=1)
+        # Cabeçalho do emissor
+        server = (stats.get("guild_name") or "servidor").upper()
+        draw.text((40, 26), _fit(draw, server, sans(22, True), 640), font=sans(22, True), fill=green)
+        draw.text((40, 56), "CARTEIRA DE MEMBRO", font=sans(15, True), fill=label_c)
+        number = f"{stats['number']:04d}" if stats.get("number") else "----"
+        draw.text((width - 40 - draw.textlength("REGISTRO Nº", font=sans(11, True)), 28), "REGISTRO Nº", font=sans(11, True), fill=label_c)
+        draw.text((width - 40 - draw.textlength(number, font=mono(30, True)), 44), number, font=mono(30, True), fill=(170, 30, 40))
+        draw.line([(40, 92), (width - 40, 92)], fill=green, width=2)
+        draw.line([(40, 97), (width - 40, 97)], fill=(170, 200, 180), width=1)
 
-        # Avatar quadrado
-        size = 196
+        # Foto 3x4
+        photo_x, photo_y, photo_w, photo_h = 40, 120, 228, 304
         if avatar is not None:
-            image.paste(ImageOps.fit(avatar, (size, size)), (margin, 92))
+            image.paste(ImageOps.fit(avatar, (photo_w, photo_h), centering=(0.5, 0.4)), (photo_x, photo_y))
         else:
-            draw.rectangle((margin, 92, margin + size, 92 + size), fill=(34, 34, 37))
+            draw.rectangle((photo_x, photo_y, photo_x + photo_w, photo_y + photo_h), fill=(200, 214, 204))
             initial = (member.display_name or "?")[:1].upper()
-            font = serif(96)
-            box = draw.textbbox((0, 0), initial, font=font)
-            draw.text((margin + (size - (box[2] - box[0])) / 2 - box[0], 92 + (size - (box[3] - box[1])) / 2 - box[1]),
-                      initial, font=font, fill=accent)
-        draw.rectangle((margin, 92, margin + size, 92 + size), outline=line, width=1)
-        draw.rectangle((margin, 92 + size + 6, margin + 56, 92 + size + 9), fill=accent)
+            box = draw.textbbox((0, 0), initial, font=serif(110))
+            draw.text((photo_x + (photo_w - (box[2] - box[0])) / 2 - box[0], photo_y + (photo_h - (box[3] - box[1])) / 2 - box[1]),
+                      initial, font=serif(110), fill=green)
+        draw.rectangle((photo_x, photo_y, photo_x + photo_w, photo_y + photo_h), outline=green, width=2)
 
-        # Nome e usuário
-        left = margin + size + 40
-        right = width - margin
-        name_font = serif(50)
-        draw.text((left, 86), _fit(draw, member.display_name, name_font, right - left), font=name_font, fill=ink)
-        draw.text((left, 152), f"@{member.name}", font=mono(18), fill=muted)
+        # Assinatura (nome inclinado, como escrito à mão) sobre a linha
+        sig = Image.new("RGBA", (photo_w + 60, 60), (0, 0, 0, 0))
+        sig_draw = ImageDraw.Draw(sig)
+        sig_draw.text((10, 6), _fit(sig_draw, member.display_name, serif_r(30), photo_w + 20), font=serif_r(30), fill=(28, 48, 120, 255))
+        sig = sig.transform(sig.size, Image.AFFINE, (1, 0.32, -6, 0, 1, 0), resample=Image.BICUBIC)
+        image.paste(sig, (photo_x - 4, photo_y + photo_h + 14), sig)
+        draw.line([(photo_x, photo_y + photo_h + 64), (photo_x + photo_w, photo_y + photo_h + 64)], fill=soft, width=1)
+        label_w = draw.textlength("ASSINATURA DO TITULAR", font=sans(10, True))
+        draw.text((photo_x + (photo_w - label_w) / 2, photo_y + photo_h + 70), "ASSINATURA DO TITULAR", font=sans(10, True), fill=label_c)
 
-        # Nível
-        draw.text((left, 200), "NÍVEL", font=mono(13, True), fill=faint)
-        draw.text((left, 218), str(stats["level"]), font=serif(40), fill=accent)
-        level_w = draw.textlength(str(stats["level"]), font=serif(40))
-        xp_text = f"{stats['xp']:,} XP".replace(",", ".") + f"  ·  faltam {stats['missing_xp']:,} para o {stats['level'] + 1}".replace(",", ".")
-        draw.text((left + level_w + 18, 238), xp_text, font=mono(15), fill=muted)
-        bar_y = 280
-        draw.line([(left, bar_y), (right, bar_y)], fill=line, width=2)
-        filled = left + int((right - left) * max(0.0, min(1.0, stats["progress"])))
-        draw.line([(left, bar_y), (filled, bar_y)], fill=accent, width=2)
-        draw.rectangle((filled - 2, bar_y - 5, filled + 2, bar_y + 5), fill=accent)
+        # Campos
+        left, right = photo_x + photo_w + 36, width - 40
 
-        # Dados
-        data = [
-            ("DESDE", stats["joined"].strftime("%d.%m.%Y")),
-            ("TEMPO DE CASA", f"{stats['days_in']} dias"),
-            ("MENSAGENS · 120D", f"{stats['messages']:,}".replace(",", ".")),
-            ("DIAS ATIVOS", str(stats["active_days"])),
-        ]
-        col = (right - left) / len(data)
-        for i, (label, value) in enumerate(data):
-            x = left + i * col
-            draw.text((x, 304), label, font=mono(12, True), fill=faint)
-            draw.text((x, 324), value, font=mono(20), fill=ink)
+        def field(x: float, y: float, label: str, value: str, w: float, font: Any) -> None:
+            draw.text((x, y), label, font=sans(11, True), fill=label_c)
+            draw.text((x, y + 16), _fit(draw, value, font, w), font=font, fill=ink)
 
-        # Conquistas
-        y = 390
-        draw.line([(margin, y - 18), (width - margin, y - 18)], fill=line, width=1)
-        draw.text((margin, y), "CONQUISTAS", font=mono(12, True), fill=faint)
-        y += 26
-        x = margin
-        badges = stats["badges"] or ["nenhuma ainda"]
-        for badge in badges:
-            w = draw.textlength(badge, font=tag_font) + 26
-            if x + w > width - margin:
-                x, y = margin, y + 40
-            draw.rectangle((x, y, x + w, y + 30), outline=accent if stats["badges"] else line, width=1)
-            draw.text((x + 13, y + 5), badge, font=tag_font, fill=ink if stats["badges"] else muted)
-            x += w + 10
-        y += 52
-        draw.text((margin, y), "CURTE", font=mono(12, True), fill=faint)
-        likes = " · ".join(stats["likes"]) if stats["likes"] else "conte pra Bella: \"meus gostos: ...\""
-        draw.text((margin + 70, y - 3), _fit(draw, likes, sans(17), width - 2 * margin - 70), font=sans(17),
-                  fill=ink if stats["likes"] else muted)
-        stamp = f"bella · {datetime.now(timezone.utc).strftime('%d.%m.%Y')}"
-        draw.text((width - margin - draw.textlength(stamp, font=mono(12)), height - 30), stamp, font=mono(12), fill=faint)
+        field(left, 118, "NOME", member.display_name.upper(), right - left, serif(30))
+        field(left, 176, "USUÁRIO", f"@{member.name}", 330, mono(20, True))
+        field(left + 380, 176, "REGISTRO DE MEMBRO", number, 260, mono(20, True))
+        field(left, 232, "DATA DE ENTRADA", stats["joined"].strftime("%d/%m/%Y"), 330, mono(20, True))
+        field(left + 380, 232, "TEMPO DE CASA", f"{stats['days_in']} DIAS", 260, mono(20, True))
+        quarter = (right - left) / 4
+        field(left, 288, "NÍVEL", str(stats["level"]), quarter - 10, mono(20, True))
+        field(left + quarter, 288, "XP", f"{stats['xp']:,}".replace(",", "."), quarter - 10, mono(20, True))
+        field(left + 2 * quarter, 288, "MENSAGENS 120D", f"{stats['messages']:,}".replace(",", "."), quarter - 10, mono(20, True))
+        field(left + 3 * quarter, 288, "DIAS ATIVOS", str(stats["active_days"]), quarter - 10, mono(20, True))
+        # Progresso até o próximo nível, discreto
+        bar_y = 344
+        draw.line([(left, bar_y), (right, bar_y)], fill=(184, 206, 190), width=3)
+        draw.line([(left, bar_y), (left + (right - left) * max(0.0, min(1.0, stats["progress"])), bar_y)], fill=green, width=3)
+        draw.text((left, bar_y + 6), f"faltam {stats['missing_xp']:,} XP para o nível {stats['level'] + 1}".replace(",", "."),
+                  font=sans(11), fill=soft)
+
+        # Conquistas (texto corrido que quebra linha) e gostos
+        draw.text((left, 378), "CONQUISTAS", font=sans(11, True), fill=label_c)
+        parts = stats["badges"] or ["nenhuma ainda"]
+        lines, current = [], ""
+        for part in parts:
+            candidate = f"{current}  •  {part}" if current else part
+            if draw.textlength(candidate, font=sans(17)) > right - left and current:
+                lines.append(current)
+                current = part
+            else:
+                current = candidate
+        lines.append(current)
+        for i, text in enumerate(lines[:2]):
+            draw.text((left, 396 + i * 24), text, font=sans(17), fill=ink)
+        likes_y = 396 + min(2, len(lines)) * 24 + 12
+        draw.text((left, likes_y), "CURTE", font=sans(11, True), fill=label_c)
+        likes = ", ".join(stats["likes"]) if stats["likes"] else 'conte pra Bella: "meus gostos: ..."'
+        draw.text((left, likes_y + 16), _fit(draw, likes, sans(17), right - left), font=sans(17), fill=ink if stats["likes"] else soft)
+
+        # Data de expedição
+        issued = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        draw.text((left, 516), "EXPEDIDA EM", font=sans(11, True), fill=label_c)
+        draw.text((left, 532), issued, font=mono(17, True), fill=ink)
+        emitter = "EMITIDA POR BELLA"
+        draw.text((right - draw.textlength(emitter, font=sans(11, True)), 536), emitter, font=sans(11, True), fill=label_c)
+
+        # Faixa de leitura no rodapé (estilo zona de leitura do documento)
+        draw.rectangle((0, height - 62, width, height), fill=(236, 242, 236))
+        draw.line([(0, height - 62), (width, height - 62)], fill=(184, 206, 190), width=1)
+        name_mrz = re.sub(r"[^A-Z0-9]+", "<", _norm(member.display_name).upper()).strip("<") or "MEMBRO"
+        user_mrz = re.sub(r"[^A-Z0-9]+", "<", _norm(member.name).upper()).strip("<")
+        line1 = f"MBR<{number}<<{name_mrz}"
+        line2 = f"{stats['joined'].strftime('%y%m%d')}<NV{stats['level']:02d}<XP{stats['xp']}<<{user_mrz}"
+        for i, text in enumerate((line1, line2)):
+            text = (text + "<" * 60)[:52]
+            draw.text((40, height - 54 + i * 24), text, font=mono(18), fill=(60, 72, 66))
 
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
