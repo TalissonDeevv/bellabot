@@ -42,6 +42,7 @@ from website_guard.autonomous_moderation import AutonomousModeration
 from src.ai.freellmapi_client import LLM_CONVERSATION_ID
 from website_guard.bella_agent import BellaAgent
 from website_guard.discord_entities import allowed_mention_ids, sanitize_model_mentions
+from website_guard.community_features import CommunityFeatures, MusicPanelView
 from website_guard.foreign_guide import ForeignGuide
 from website_guard.owner_assistant import OwnerAssistant
 from website_guard.reminder_service import ReminderService, looks_like_reminder_request
@@ -531,6 +532,8 @@ executive_assistant.owner_channel_id = owner_assistant.channel_id
 bella_agent.decision_checker = owner_assistant.check_decisions
 # Guia para quem fala outro idioma: explica o servidor/canal no idioma da pessoa.
 foreign_guide = ForeignGuide(ai_service)
+# Elogio anônimo, revisão de ideia, playlist da semana e cartão de membro.
+community = CommunityFeatures(bot, state, ai_service=ai_service)
 automation_center = KnowledgeAutomationCenter(state, ai_service)
 english_learning = EnglishLearningManager(state, ai_service)
 
@@ -908,6 +911,9 @@ async def on_ready() -> None:
     if not ticket_admin_panel_view_registered:
         bot.add_view(TicketAdminPanelView())
         ticket_admin_panel_view_registered = True
+    if not getattr(community, "view_registered", False):
+        bot.add_view(MusicPanelView(community))
+        community.view_registered = True
     if not english_admin_panel_view_registered:
         bot.add_view(EnglishAdminPanelView())
         english_admin_panel_view_registered = True
@@ -1004,6 +1010,7 @@ async def on_ready() -> None:
     _start_task("site", site_monitor_worker())
     _start_task("reminders", reminder_service.worker())
     _start_task("owner_assistant", owner_assistant.worker())
+    _start_task("community", community.worker())
     _start_task("feedbacks", feedback_monitor_worker())
     _start_task("changes", change_monitor_worker())
     if github_site_monitor.configured:
@@ -1729,6 +1736,19 @@ async def _handle_message(message: discord.Message) -> None:
             owner_reply = PUBLIC_CONTINGENCY_MESSAGE
         if owner_reply:
             await _reply_public(message, owner_reply)
+            return
+    if ai_allowed_here or message.guild is None:
+        try:
+            community_reply = await community.handle(message, clean_content or content, invoked=invoked)
+        except Exception:
+            LOGGER.exception("Falha nas funções da comunidade para a mensagem %s", message.id)
+            community_reply = None
+            if invoked or message.guild is None:
+                await _reply_public(message, PUBLIC_CONTINGENCY_MESSAGE)
+                return
+        if community_reply is not None:
+            if community_reply.text:
+                await _reply_public(message, community_reply.text, from_model=True)
             return
     foreign_language = (
         foreign_guide.should_handle(message, clean_content or content, invoked=invoked)

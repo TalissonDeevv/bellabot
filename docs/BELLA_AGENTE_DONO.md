@@ -135,3 +135,21 @@ que a pessoa vê (com tópicos), o canal de regras, as mensagens fixadas e as
 escreve uma explicação natural. O resumo de cada canal fica guardado por 6 h
 para economizar cota. Português segue o fluxo normal; tópicos (tickets, aulas)
 ficam de fora. Se a IA falhar, responde uma mensagem curta no idioma da pessoa.
+
+## Funções da comunidade
+
+`website_guard/community_features.py`:
+
+- **Elogio anônimo** (só pela DM da Bella): "manda um elogio anônimo pro Fulano dizendo que...".
+  A IA confere se é elogio de verdade (bloqueia ofensa, ironia, assédio, cantada) e reescreve com
+  carinho; a pessoa recebe na DM sem saber quem mandou. Até `COMPLIMENTS_PER_DAY` (5) por dia e um
+  por pessoa por dia. Quem enviou fica registrado em `community_compliments` só para moderação.
+- **Revisão de ideia**: "tenho uma ideia de app que..." → ela faz 3 perguntas; a resposta seguinte da
+  pessoa recebe pontos fortes, riscos e por onde começar, sem código.
+- **Playlist da semana**: "indico a música X do Y" busca a música (capa, cantor, álbum, gênero) e soma
+  voto; "playlist da semana" posta o painel em imagem com 5 por página, botões de página e menu de voto
+  (funcionam depois de reiniciar). Respondendo ao painel, a opinião sobre a música citada (nome, cantor
+  ou posição) fica guardada. Com `MUSIC_CHANNEL_ID`, domingo 20h ela posta o ranking fechado.
+- **Cartão de membro**: "meu perfil" gera a imagem (nível/XP, tempo no servidor, mensagens, dias
+  ativos, conquistas e gostos) e posta em `MEMBER_CARD_CHANNEL_ID` (padrão 1467981828559212544).
+  "meus gostos: python, anime" guarda os gostos; artistas indicados também entram.
