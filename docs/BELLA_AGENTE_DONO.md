@@ -24,6 +24,7 @@ tratada como falada com ela (`website_guard/owner_assistant.py`).
 | "vou ficar fora até dia 20", "vou viajar até 20/12", "férias até segunda" | **Modo viagem**: marca a ausência (quem te chama fica sabendo o dia da volta e pode deixar recado), muda o status da Bella e guarda tudo. "voltei" (ou automaticamente no dia seguinte à volta, 9h) entrega o resumo: menções (urgentes primeiro), recados, tickets/orçamentos, dinheiro e tarefas. |
 | "ideia: fazer curso de bots" (no canal) | **Caixa de ideias**. "minhas ideias" lista. Dia 1 de cada mês (11h) ela pergunta quais tirar do papel: "a 1 e a 3" vira tarefa, "descarta a 2" arquiva. |
 | "Contabo vence dia 10 todo mês R$ 40" | **Contas a pagar**: lembra 2 dias antes, todo mês, uma vez por vencimento. "paguei a Contabo", "minhas contas", "remove a conta da Contabo". |
+| "manda um recado pro @fulano de que o bot dele tá pronto, manda na DM" / "avisa o @fulano no #geral que..." | **Recado**: a IA reescreve o pedido com as palavras da Bella (cumprimenta, diz que o Talisson pediu, mantém todos os fatos) e envia na DM ou no canal mencionado (notificando só a pessoa). Aceita nome sem menção; se houver duas pessoas com o mesmo nome, pergunta. DM fechada: avisa e sugere canal. Sem canal indicado, vai na DM. Registro em `owner_relays`. |
 | "o que eu tava fazendo?", "onde parei?" | Últimos pedidos da sessão, tarefas abertas nela e compromissos de hoje. Ao voltar depois de `OWNER_PAUSE_HOURS` (padrão 3 h) sem falar no canal, ela manda isso sozinha como "bem-vindo de volta". |
 
 Alertas automáticos no canal:

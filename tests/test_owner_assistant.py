@@ -297,5 +297,100 @@ class OwnerDailyLifeTests(unittest.IsolatedAsyncioTestCase):
         await self.owner._add_todo(text)
 
 
+class FakeMember:
+    def __init__(self, member_id: int, name: str, *, blocked: bool = False) -> None:
+        self.id = member_id
+        self.display_name = name
+        self.name = name.casefold()
+        self.bot = False
+        self.blocked = blocked
+        self.sent: list[str] = []
+
+    async def send(self, text, **kwargs):
+        if self.blocked:
+            raise __import__("discord").Forbidden(SimpleNamespace(status=403, reason="x"), "dm fechada")
+        self.sent.append(text)
+        return SimpleNamespace(id=1)
+
+
+class RelayAI:
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def generate_text(self, prompt, **kwargs):
+        self.prompts.append(prompt)
+        name = prompt.split("PESSOA: ")[1].split("\n")[0]
+        return (
+            f"Olá, {name}, tudo bem? O Talisson me pediu pra te dar um recado: seu bot de Discord já "
+            "está pronto! Ele só precisa que você confirme o restante das informações lá no canal de ticket. ♡"
+        )
+
+
+class RelayTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.state = StateStore(Path(self._dir.name) / "s.json")
+        self.bot = FakeBot()
+        self.fulano = FakeMember(4242, "Fulano")
+        self.channel = FakeChannel(channel_id=777000000000000777)
+        self.channel.mention = "<#777000000000000777>"
+        self.bot.get_channel = lambda cid: {CHANNEL: self.bot.channel, self.channel.id: self.channel}.get(cid)
+        self.guild = SimpleNamespace(id=5, members=[self.fulano, FakeMember(1, "Ana"), FakeMember(2, "Ana")])
+        self.ai = RelayAI()
+        self.owner = OwnerAssistant(self.bot, self.state, owner_id=OWNER, channel_id=CHANNEL, ai_service=self.ai)
+
+    async def asyncTearDown(self) -> None:
+        self._dir.cleanup()
+
+    def _msg(self, text: str, mentions=(), channel_id: int = 9):
+        return SimpleNamespace(
+            content=text, author=SimpleNamespace(id=OWNER, bot=False, display_name="Talisson"),
+            channel=SimpleNamespace(id=channel_id), guild=self.guild, attachments=[], mentions=list(mentions), id=10,
+        )
+
+    async def test_dm_relay_is_written_by_ai(self) -> None:
+        text = (
+            "<@1> manda um recado pro <@4242> de que o bot de discord dele já está pronto. "
+            "Só falta ele me passar o restante das informações pra mim. Mande na DM dele"
+        )
+        answer = await self.owner.handle(self._msg(text, [self.fulano]), text)
+        self.assertEqual(len(self.fulano.sent), 1)
+        self.assertIn("Olá, Fulano", self.fulano.sent[0])
+        self.assertIn("mandei pro **Fulano** na DM", answer)
+        # A IA recebe o pedido com o nome no lugar da menção.
+        self.assertIn("pro Fulano de que o bot", self.ai.prompts[0])
+        self.assertIn("na mensagem privada", self.ai.prompts[0])
+
+    async def test_channel_relay_mentions_only_the_person(self) -> None:
+        text = f"avisa o <@4242> no <#{self.channel.id}> que a reunião mudou pra amanhã às 15h"
+        answer = await self.owner.handle(self._msg(text, [self.fulano]), text)
+        self.assertEqual(self.fulano.sent, [])
+        self.assertTrue(self.channel.sent[0].startswith("<@4242>"))
+        self.assertIn("<#777000000000000777>", answer)
+
+    async def test_closed_dm_is_reported(self) -> None:
+        blocked = FakeMember(99, "Ciclano", blocked=True)
+        text = "manda uma mensagem pro <@99> que o site ficou pronto"
+        answer = await self.owner.handle(self._msg(text, [blocked]), text)
+        self.assertIn("DM dele tá fechada", answer)
+
+    async def test_name_without_mention_and_ambiguity(self) -> None:
+        answer = await self.owner.handle(self._msg("manda um recado pro Fulano que amanhã tem call"), "manda um recado pro Fulano que amanhã tem call")
+        self.assertEqual(len(self.fulano.sent), 1)
+        ambiguous = await self.owner.handle(self._msg("manda um recado pra Ana que o pix caiu"), "manda um recado pra Ana que o pix caiu")
+        self.assertIn("mais de uma pessoa", ambiguous)
+
+    async def test_ai_down_uses_fallback(self) -> None:
+        self.owner.ai = None
+        text = "manda um recado pro <@4242> que o pagamento foi confirmado. manda no privado"
+        await self.owner.handle(self._msg(text, [self.fulano]), text)
+        self.assertIn("o pagamento foi confirmado", self.fulano.sent[0])
+        self.assertNotIn("privado", self.fulano.sent[0])
+
+    async def test_talking_to_bella_is_not_a_relay(self) -> None:
+        self.assertIsNone(await self.owner.handle(self._msg("fala pra mim uma curiosidade"), "fala pra mim uma curiosidade"))
+        self.assertEqual(self.fulano.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main()

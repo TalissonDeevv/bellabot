@@ -87,6 +87,16 @@ MONTHLY_RE = re.compile(r"\b(?:todo mes|todos os meses|mensal\w*|de cada mes|tod
 BILL_LIST_RE = re.compile(r"\b(?:minhas contas|contas (?:a|pra|para) pagar|contas do mes|quais contas)\b")
 BILL_PAID_RE = re.compile(r"^(?:bella[,:]?\s*)?(?:ja )?pag(?:uei|amos|o)\s+(?:a |o |as |os )?(?:conta (?:da |do |de )?)?(.+)$")
 BILL_REMOVE_RE = re.compile(r"\b(?:remove|apaga|tira|cancela|exclui)\w* (?:a )?conta (?:da |do |de )?(.+)$")
+RELAY_SECTION = "owner_relays"
+RELAY_RE = re.compile(
+    r"\b(?:manda|mande|mandar|envia|envie|enviar|passa|passe|deixa|deixe|da|de|dar)\w*\s+"
+    r"(?:um |uma |o |a |esse |essa |meu |minha |)(?:recado|aviso|mensagem|msg|lembrete)\b"
+    r"|\b(?:avisa|avise|avisar|fala|fale|falar|diz|diga|dizer|lembra|lembre|lembrar|comunica|comunique)\s+"
+    r"(?:pro|pra|para|ao|a|o|à|pros|pras)\s+(?!(?:mim|eu|me|voce|vc|ti|nos|gente|que|quando|se)\b)(?:@|<@|[a-z])"
+    r"|\bmanda\w*\s+(?:na|no)\s+(?:dm|pv|privado|direct)\b"
+)
+DM_RE = re.compile(r"\b(?:dm|pv|privado|privada|direct|inbox)\b")
+CHANNEL_DELIVERY_RE = re.compile(r"(?:\b(?:no|na|em|pelo|pela|canal)\s*)<#(\d{15,22})>")
 DOING_RE = re.compile(r"\b(?:o que (?:eu )?(?:tava|estava) fazendo|onde (?:eu )?parei|o que ficou (?:pela metade|pendente)|em que (?:eu )?parei)\b")
 COMMIT_RE = re.compile(r"\b(?:aceit\w*|fech\w*|peg\w*|cobr\w*|faz\w*|vou fazer)\b")
 MONEY_RE = re.compile(r"(?:r\$\s*\d|\d+\s*(?:reais|conto|mil)\b)")
@@ -185,6 +195,10 @@ class OwnerAssistant:
             return await self.what_was_i_doing()
         if welcome:
             await self.say(welcome)
+        if RELAY_RE.search(text) and getattr(message, "guild", None) is not None:
+            relay = await self.send_relay(message, content)
+            if relay:
+                return relay
         if in_channel and self._audio(message) is not None:
             return await self.start_spoken_agenda(message)
         if RETURN_RE.search(text) and await self._travel():
@@ -805,6 +819,123 @@ class OwnerAssistant:
         if not ideas.startswith("ainda não"):
             lines += ["", ideas]
         return "\n".join(lines)
+
+    # ------------------------------------------------------------- recados
+    def _relay_targets(self, message: Any, content: str) -> tuple[list[Any], str]:
+        """Pessoas que vão receber o recado. Devolve (membros, pergunta_se_ambíguo)."""
+        bot_id = getattr(getattr(self.bot, "user", None), "id", None)
+        targets = [
+            m for m in getattr(message, "mentions", []) or []
+            if getattr(m, "id", None) not in {bot_id, self.owner_id} and not getattr(m, "bot", False)
+        ]
+        if targets:
+            return list({m.id: m for m in targets}.values()), ""
+        guild = getattr(message, "guild", None)
+        name_match = re.search(
+            r"\b(?:pro|pra|para o|para a|para|ao|à)\s+([\wÀ-ÿ.\- ]{2,40}?)(?=\s+(?:de que|que|dizendo|falando|avisando|sobre|na dm|no pv|no privado)\b|[,.:]|$)",
+            _strip_lead(content), re.IGNORECASE,
+        )
+        if guild is None or not name_match:
+            return [], "pra quem eu mando? menciona a pessoa (@fulano)."
+        wanted = _norm(name_match.group(1)).strip()
+        members = [m for m in getattr(guild, "members", []) if not getattr(m, "bot", False)]
+        exact = [m for m in members if wanted in {_norm(m.display_name), _norm(getattr(m, "name", ""))}]
+        partial = exact or [m for m in members if wanted and wanted in _norm(m.display_name)]
+        if len(partial) == 1:
+            return partial, ""
+        if len(partial) > 1:
+            names = ", ".join(m.display_name for m in partial[:5])
+            return [], f"achei mais de uma pessoa com esse nome ({names}). menciona quem é, por favor."
+        return [], f"não achei ninguém chamado \"{name_match.group(1).strip()}\" no servidor. menciona a pessoa (@fulano)."
+
+    def _relay_destination(self, message: Any, content: str) -> tuple[str, Any]:
+        """('dm', None) ou ('canal', canal)."""
+        norm = _norm(re.sub(r"<[@#][!&]?\d+>", " ", content))
+        if DM_RE.search(norm):
+            return "dm", None
+        delivery = CHANNEL_DELIVERY_RE.search(content)
+        if delivery:
+            channel = self.bot.get_channel(int(delivery.group(1)))
+            guild = getattr(message, "guild", None)
+            if channel is None and guild is not None:
+                getter = getattr(guild, "get_channel_or_thread", None) or getattr(guild, "get_channel", None)
+                channel = getter(int(delivery.group(1))) if callable(getter) else None
+            if channel is not None:
+                return "canal", channel
+        return "dm", None
+
+    async def _compose_relay(self, instruction: str, target: Any, destination: str) -> tuple[str, str]:
+        name = getattr(target, "display_name", "") or getattr(target, "name", "")
+        fallback_body = re.sub(
+            r"(?i)^.*?\b(?:de que|dizendo que|falando que|avisando que|que)\s+", "", instruction, count=1,
+        )
+        fallback_body = re.sub(r"(?i)[.,]?\s*(?:mand[ae]|envi[ae])\w*\s+(?:na|no|pela|pelo)\s+(?:dm|pv|privado|direct|canal)\b.*$", "", fallback_body).strip(" .")
+        fallback = f"Oi, {name}! Tudo bem? O Talisson me pediu pra te passar um recado: {fallback_body}."
+        if self.ai is not None:
+            where = "na mensagem privada (DM) dela" if destination == "dm" else "num canal do servidor, então comece mencionando a pessoa"
+            try:
+                text = await self.ai.generate_text(
+                    "Você é a Bella, assistente do Talisson num servidor do Discord. O Talisson te pediu "
+                    "para dar um recado a uma pessoa. Escreva SÓ a mensagem que vai ser enviada para ela, "
+                    f"{where}.\n\n"
+                    f"PESSOA: {name}\n"
+                    f"PEDIDO DO TALISSON: {instruction}\n\n"
+                    "Regras: cumprimente a pessoa pelo nome; diga que o Talisson pediu para você dar o "
+                    "recado; reescreva o conteúdo com suas palavras, falando direto com ela (você), de "
+                    "forma natural e simpática; mantenha TODOS os fatos e pedidos, sem inventar nada; "
+                    "não inclua as instruções de entrega (\"manda na DM\", \"no canal\"); mantenha links e "
+                    "menções <#...> exatamente; de 1 a 4 frases; pode usar ♡ no máximo uma vez; nunca "
+                    "chame ninguém de 'Senhor'.",
+                    max_output_tokens=300,
+                    timeout_seconds=25,
+                    use_cache=False,
+                )
+                text = str(text or "").strip().strip('"')
+                if 20 <= len(text) <= 1800:
+                    return text, "ia"
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("IA indisponível para escrever o recado: %s", type(exc).__name__)
+        return fallback, "contingencia"
+
+    async def send_relay(self, message: Any, content: str) -> str:
+        targets, problem = self._relay_targets(message, content)
+        if problem:
+            explicit = re.search(r"\b(?:recado|aviso|mensagem|msg)\b", _norm(content))
+            return problem if explicit or getattr(message, "mentions", None) else ""
+        destination, channel = self._relay_destination(message, content)
+        bot_id = getattr(getattr(self.bot, "user", None), "id", 0)
+        instruction = re.sub(rf"<@!?{bot_id}>", " ", content)
+        for member in targets:
+            instruction = re.sub(rf"<@!?{member.id}>", getattr(member, "display_name", "a pessoa"), instruction)
+        instruction = _strip_lead(instruction)[:1500]
+        reports = []
+        for member in targets[:10]:
+            text, origin = await self._compose_relay(instruction, member, destination)
+            try:
+                if destination == "canal":
+                    if f"<@{member.id}>" not in text and f"<@!{member.id}>" not in text:
+                        text = f"<@{member.id}> {text}"
+                    sent = await channel.send(text[:2000], allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False))
+                    where = getattr(channel, "mention", "o canal")
+                else:
+                    sent = await member.send(text[:2000], allowed_mentions=discord.AllowedMentions.none())
+                    where = "na DM"
+            except discord.Forbidden:
+                reports.append(
+                    f"não consegui mandar pro {member.display_name}: "
+                    + ("a DM dele tá fechada. quer que eu mande num canal? é só dizer qual." if destination == "dm" else "não tenho permissão nesse canal.")
+                )
+                continue
+            except discord.HTTPException as exc:
+                reports.append(f"o Discord recusou o recado pro {member.display_name} ({exc.status}). tenta de novo daqui a pouco?")
+                continue
+            await self.state.update_section(RELAY_SECTION, f"r{int(time.time() * 1000)}-{member.id}", {
+                "to": member.id, "where": destination, "channel_id": getattr(channel, "id", None),
+                "message_id": getattr(sent, "id", None), "text": text[:2000], "origin": origin,
+                "instruction": instruction, "at": datetime.now(timezone.utc).isoformat(),
+            })
+            reports.append(f"mandei pro **{member.display_name}** {where}: ♡\n> " + text[:900].replace("\n", "\n> "))
+        return "\n\n".join(reports)
 
     # ------------------------------------------- "o que eu tava fazendo?"
     async def _track_activity(self, content: str, *, in_channel: bool) -> str:
