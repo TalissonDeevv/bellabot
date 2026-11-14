@@ -42,6 +42,7 @@ from website_guard.autonomous_moderation import AutonomousModeration
 from src.ai.freellmapi_client import LLM_CONVERSATION_ID
 from website_guard.bella_agent import BellaAgent
 from website_guard.discord_entities import allowed_mention_ids, sanitize_model_mentions
+from website_guard.foreign_guide import ForeignGuide
 from website_guard.owner_assistant import OwnerAssistant
 from website_guard.reminder_service import ReminderService, looks_like_reminder_request
 from website_guard.automation import (
@@ -527,6 +528,8 @@ owner_assistant = OwnerAssistant(
 )
 executive_assistant.owner_channel_id = owner_assistant.channel_id
 bella_agent.decision_checker = owner_assistant.check_decisions
+# Guia para quem fala outro idioma: explica o servidor/canal no idioma da pessoa.
+foreign_guide = ForeignGuide(ai_service)
 automation_center = KnowledgeAutomationCenter(state, ai_service)
 english_learning = EnglishLearningManager(state, ai_service)
 
@@ -1726,6 +1729,22 @@ async def _handle_message(message: discord.Message) -> None:
         if owner_reply:
             await _reply_public(message, owner_reply)
             return
+    foreign_language = (
+        foreign_guide.should_handle(message, clean_content or content, invoked=invoked)
+        if ai_allowed_here
+        and message.author.id != owner_assistant.owner_id
+        and not isinstance(message.channel, discord.Thread)
+        else ""
+    )
+    if foreign_language:
+        try:
+            async with message.channel.typing():
+                guide_reply = await foreign_guide.answer(message, clean_content or content, foreign_language)
+        except Exception:
+            LOGGER.exception("Falha no guia em outro idioma para a mensagem %s", message.id)
+            guide_reply = foreign_guide._fallback(foreign_language, message.guild.name)
+        await _reply_public(message, guide_reply, from_model=True)
+        return
     if invoked and await _handle_owner_mass_mention_request(
         message,
         clean_content or content,

@@ -123,3 +123,15 @@ FreeLLMAPI (Cerebras, OpenRouter, Mistral, GitHub Models, NVIDIA).
 Arquivos novos: `test_owner_assistant.py`, `test_quote_intake.py`,
 `test_reminders_mentions.py`, `test_freellmapi_client.py` (retry/backoff),
 `test_bella_direct_and_memory.py`.
+
+## Guia em outros idiomas
+
+`website_guard/foreign_guide.py`. Quando alguém escreve para a Bella em inglês,
+espanhol, francês, alemão ou italiano (ou um membro com menos de 14 dias
+pergunta, perdido, sobre o servidor/canal, mesmo sem mencionar), ela responde
+no idioma da pessoa. Para isso lê o nome e a descrição do servidor, os canais
+que a pessoa vê (com tópicos), o canal de regras, as mensagens fixadas e as
+últimas 80 mensagens do canal perguntado (ou do canal mencionado), e a IA
+escreve uma explicação natural. O resumo de cada canal fica guardado por 6 h
+para economizar cota. Português segue o fluxo normal; tópicos (tickets, aulas)
+ficam de fora. Se a IA falhar, responde uma mensagem curta no idioma da pessoa.
